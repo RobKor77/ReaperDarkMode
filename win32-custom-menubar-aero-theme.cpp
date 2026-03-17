@@ -6,7 +6,7 @@ Description:    Provides a full dark mode implementation for Reaper (Windows pla
 
 Author:         Copyright (c) 2026 Rob Kor (Wormhole Labs)
 Created:        2026
-Version:        Release v1.0
+Version:        Release v1.0.1
 
 Platform:       Windows 10, Windows 11
 Compiler:       MSVC / Visual Studio
@@ -871,7 +871,7 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
         if (classType == WND_BUTTON) {
             DWORD style = GetWindowLong(hWnd, GWL_STYLE) & BS_TYPEMASK;
 
-            // UNIFIED FIX FOR CHECKBOXES AND RADIO BUTTONS (FX + SYSTEM WINDOWS)
+            // Handle DPI-aware checkbox and radio button rendering
             if (style == BS_CHECKBOX || style == BS_AUTOCHECKBOX ||
                 style == BS_RADIOBUTTON || style == BS_AUTORADIOBUTTON ||
                 style == BS_3STATE || style == BS_AUTO3STATE) {
@@ -880,35 +880,41 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                 GetWindowTextW(hWnd, text, 256);
 
                 if ((int)wcslen(text) > 0) {
-
+                    // 1. Let the OS draw the native control (glyph + native text)
                     LRESULT result = DefSubclassProc(hWnd, uMsg, wParam, lParam);
 
                     HDC hdc = GetDC(hWnd);
                     RECT rc; GetClientRect(hWnd, &rc);
 
+                    // 2. Calculate accurate DPI scale factor
+                    int dpiX = GetDeviceCaps(hdc, LOGPIXELSX);
+                    if (dpiX == 0) dpiX = 96; // Fallback to 100%
+                    float scale = (float)dpiX / 96.0f;
+
+                    // 3. THE SWEET SPOT (Pixel-perfect cut)
+                    // At 100%, the box ends ~14px, native text starts ~16px.
+                    // We slice exactly at 15px and scale it perfectly.
+                    int clearOffset = (int)(15.0f * scale);
+                    int textOffset = (int)(19.0f * scale);
+
+                    // 4. Erase the native text exactly between the box and the text
                     RECT rcClear = rc;
-                    rcClear.left += 15;
+                    rcClear.left += clearOffset;
                     HBRUSH bg = GetWindowBgBrush(hWnd);
                     FillRect(hdc, &rcClear, bg);
 
+                    // 5. Draw the custom text
                     HFONT hFont = (HFONT)SendMessageW(hWnd, WM_GETFONT, 0, 0);
                     HFONT hOldFont = (HFONT)SelectObject(hdc, hFont);
 
                     bool isDisabled = (!IsWindowEnabled(hWnd) || GetPropW(hWnd, L"FakeDisabled") != NULL);
-                    if (isDisabled) {
-                        SetTextColor(hdc, g_DisabledTextColor);
-                    }
-                    else {
-                        SetTextColor(hdc, g_TextColor);
-                    }
+                    SetTextColor(hdc, isDisabled ? g_DisabledTextColor : g_TextColor);
                     SetBkMode(hdc, TRANSPARENT);
 
                     RECT rcText = rc;
-                    rcText.left += 16; // horizontal text offset
-                    rcText.top += 0;   // vertical alignment
-                    rcText.bottom += 0;
+                    rcText.left += textOffset;
 
-                    DrawTextW(hdc, text, -1, &rcText, DT_SINGLELINE | DT_LEFT | DT_VCENTER);
+                    DrawTextW(hdc, text, -1, &rcText, DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_NOPREFIX);
 
                     SelectObject(hdc, hOldFont);
                     ReleaseDC(hWnd, hdc);
