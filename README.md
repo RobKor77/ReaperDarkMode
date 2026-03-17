@@ -2,8 +2,9 @@
 
 A Windows plugin that applies dark mode styling to REAPER UI elements, including menus, dialogs, list views, tree views, tab controls, edit fields, and other native Win32 components.
 
-![](menubar-custom.gif)
-![](menubar-normal.gif)
+![](ReaperDarkMode-1-res.gif)
+![](ReaperDarkMode-2-res.gif)
+![](ReaperDarkMode-3-res.gif)
 
 ---
 
