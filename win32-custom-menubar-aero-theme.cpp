@@ -6,7 +6,7 @@ Description:    Provides a full dark mode implementation for Reaper (Windows pla
 
 Author:         Copyright (c) 2026 Rob Kor (Wormhole Labs)
 Created:        2026
-Version:        Release v1.0.1
+Version:        Release v1.0.2
 
 Platform:       Windows 10, Windows 11
 Compiler:       MSVC / Visual Studio
@@ -174,6 +174,7 @@ static HBRUSH g_hbrEdit = NULL;
 static std::wstring g_IniPath = L"";
 static FILETIME g_LastIniTime = { 0 };
 static UINT_PTR g_IniTimerID = 0;
+static HWND g_ReaperMainWindow = NULL;
 static bool g_bIsEnabled = true;
 static bool g_LastEnabledState = true;
 
@@ -498,6 +499,20 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
     GetClassName(hWnd, className, 256);
 
     WndClass classType = (WndClass)dwRefData;
+
+    // --- SAFE SHUTDOWN CLEANUP ---
+    if (uMsg == WM_DESTROY && hWnd == g_ReaperMainWindow) {
+        if (g_IniTimerID) {
+            KillTimer(hWnd, g_IniTimerID);
+            g_IniTimerID = 0;
+        }
+        if (g_hHook) {
+            UnhookWindowsHookEx(g_hHook);
+            g_hHook = NULL;
+        }
+    }
+
+
 
     if (classType == WND_BUTTON) {
         if (uMsg == WM_SETTEXT || uMsg == BM_SETCHECK || uMsg == BM_SETSTATE) {
@@ -1596,11 +1611,12 @@ extern "C" __declspec(dllexport) int ReaperPluginEntry(void* r, void* v) {
             hwnd = GetWindow(hwnd, GW_HWNDNEXT);
         }
         g_hHook = SetWindowsHookEx(WH_CBT, CBTProc, NULL, GetCurrentThreadId());
-        HWND reaperMain = FindWindow(L"REAPERwnd", NULL);
-        if (reaperMain) {
-            SendMessage(reaperMain, WM_THEMECHANGED, 0, 0);
 
-            g_IniTimerID = SetTimer(reaperMain, 8899, 1000, CheckIniTimerProc);
+        // Save the main window handle to a global variable
+        g_ReaperMainWindow = FindWindow(L"REAPERwnd", NULL);
+        if (g_ReaperMainWindow) {
+            SendMessage(g_ReaperMainWindow, WM_THEMECHANGED, 0, 0);
+            g_IniTimerID = SetTimer(g_ReaperMainWindow, 8899, 1000, CheckIniTimerProc);
         }
         return 1;
     }
@@ -1613,15 +1629,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     case DLL_PROCESS_ATTACH:
         break;
     case DLL_PROCESS_DETACH:
-        if (g_hHook) {
-            UnhookWindowsHookEx(g_hHook);
-            g_hHook = NULL;
-        }
+        // WARNING: Do not call FindWindow, KillTimer, or UnhookWindowsHookEx here!
+        // Doing so causes a deadlock and leaves REAPER as a zombie process in the Task Manager.
+        // Cleanup is now safely moved to WM_DESTROY inside UniversalSubclassProc.
 
-        if (g_IniTimerID) {
-            HWND reaperMain = FindWindow(L"REAPERwnd", NULL);
-            if (reaperMain) KillTimer(reaperMain, g_IniTimerID);
-        }
+        // Deleting GDI objects (colors and brushes) is safe here.
         if (g_hbrMainBackground) DeleteObject(g_hbrMainBackground);
         if (g_hbrChildBackground) DeleteObject(g_hbrChildBackground);
         if (g_hbrEdit) DeleteObject(g_hbrEdit);
