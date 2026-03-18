@@ -6,7 +6,7 @@ Description:    Provides a full dark mode implementation for Reaper (Windows pla
 
 Author:         Copyright (c) 2026 Rob Kor (Wormhole Labs)
 Created:        2026
-Version:        Release v1.0.2
+Version:        Release v1.0.3
 
 Platform:       Windows 10, Windows 11
 Compiler:       MSVC / Visual Studio
@@ -1108,11 +1108,23 @@ static WndClass GetWindowClassType(const wchar_t* className) {
 
 static void StyleWindow(HWND hwnd) {
     wchar_t className[256] = { 0 };
-    if (!GetClassName(hwnd, className, 256)) return;
-
+    if (!GetClassNameW(hwnd, className, 256)) return;
 
     // --- IGNORE MENUS ---
     if (wcscmp(className, CLASSNAME_MENU) == 0) return;
+
+    // --- PROTECT FLOATING OVERLAYS (MIDI Razor Edit) ---
+    // Floating overlay windows usually have no title and are WS_POPUP (not tied to a frame).
+    LONG wndStyle = GetWindowLong(hwnd, GWL_STYLE);
+    if ((wndStyle & WS_POPUP) && !(wndStyle & WS_CAPTION)) {
+        wchar_t wndTitle[256] = { 0 };
+        GetWindowTextW(hwnd, wndTitle, 256);
+        // If it has no title, skip it (likely an external DLL overlay)
+        if (wcslen(wndTitle) == 0) {
+            return;
+        }
+    }
+    // ---------------------------------------------------
 
     HWND root = GetAncestor(hwnd, GA_ROOT);
 
@@ -1213,6 +1225,20 @@ static void StyleWindow(HWND hwnd) {
 
     // Capture "REAPERwnd" as well as floating windows ("REAPERdocker")
     if (wcsncmp(className, CLASSNAME_REAPER_PREFIX, 6) == 0) {
+
+        // --- SHIELD FOR MIDI CHILD WINDOWS ---
+        if (root) {
+            wchar_t rootTitle[256] = { 0 };
+            GetWindowTextW(root, rootTitle, 256);
+
+            // If we are inside the MIDI editor and this is a child window (starts with REAPER)
+            // we simply skip it and do not apply dark mode / subclassing.
+            if (wcsstr(rootTitle, L"MIDI") != NULL && hwnd != root) {
+                return; // Abort function, leave the window alone!
+            }
+        }
+        // -------------------------------------
+
         SetWindowTheme(hwnd, L"DarkMode_Explorer", NULL);
         SetWindowSubclass(hwnd, UniversalSubclassProc, 1, (DWORD_PTR)GetWindowClassType(className));
     }
@@ -1598,21 +1624,28 @@ static VOID CALLBACK CheckIniTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, D
 extern "C" __declspec(dllexport) int ReaperPluginEntry(void* r, void* v) {
     if (r) {
         LoadConfig();
-        InitDarkApi();
-        DWORD pid = GetCurrentProcessId();
-        HWND hwnd = GetTopWindow(GetDesktopWindow());
-        while (hwnd) {
-            DWORD wpid;
-            GetWindowThreadProcessId(hwnd, &wpid);
-            if (wpid == pid) {
-                StyleWindow(hwnd);
-                EnumChildWindows(hwnd, EnumAllChildren, 0);
-            }
-            hwnd = GetWindow(hwnd, GW_HWNDNEXT);
-        }
-        g_hHook = SetWindowsHookEx(WH_CBT, CBTProc, NULL, GetCurrentThreadId());
 
-        // Save the main window handle to a global variable
+        // SYNC STATE: Ensure timer logic knows the correct initial state
+        g_LastEnabledState = g_bIsEnabled;
+
+        InitDarkApi();
+
+        // Only apply initial styling and hooks if enabled in INI
+        if (g_bIsEnabled) {
+            DWORD pid = GetCurrentProcessId();
+            HWND hwnd = GetTopWindow(GetDesktopWindow());
+            while (hwnd) {
+                DWORD wpid;
+                GetWindowThreadProcessId(hwnd, &wpid);
+                if (wpid == pid) {
+                    StyleWindow(hwnd);
+                    EnumChildWindows(hwnd, EnumAllChildren, 0);
+                }
+                hwnd = GetWindow(hwnd, GW_HWNDNEXT);
+            }
+            g_hHook = SetWindowsHookEx(WH_CBT, CBTProc, NULL, GetCurrentThreadId());
+        }
+
         g_ReaperMainWindow = FindWindow(L"REAPERwnd", NULL);
         if (g_ReaperMainWindow) {
             SendMessage(g_ReaperMainWindow, WM_THEMECHANGED, 0, 0);
