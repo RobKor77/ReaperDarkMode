@@ -6,7 +6,7 @@ Description:    Provides a full dark mode implementation for Reaper (Windows pla
 
 Author:         Copyright (c) 2026 Rob Kor (Wormhole Labs)
 Created:        2026
-Version:        Release v1.0.3
+Version:        Release v1.0.4
 
 Platform:       Windows 10, Windows 11
 Compiler:       MSVC / Visual Studio
@@ -34,6 +34,14 @@ You may use, modify, and distribute it freely.
 #include <commctrl.h>
 #include <string>
 #include <shlwapi.h>
+
+// Minimal REAPER plugin info structure for API access
+typedef struct REAPER_PLUGIN_INFO {
+    int caller_version;
+    HWND hwnd_main;
+    int (*Register)(const char* name, void* infostruct);
+    void* (*GetFunc)(const char* name);
+} REAPER_PLUGIN_INFO;
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "uxtheme.lib")
@@ -74,7 +82,7 @@ static COLORREF g_colorChild = RGB(32, 32, 32);
 static COLORREF g_colorEdit = RGB(35, 35, 35);
 static COLORREF g_TextColor = RGB(160, 160, 160);
 static COLORREF g_DisabledTextColor = RGB(120, 120, 120);
-static COLORREF g_MainWindowBorder = RGB(90, 90, 90);
+static COLORREF g_MainWindowBorder = RGB(60, 60, 90);
 static COLORREF g_BorderColor = RGB(70, 70, 70);
 static COLORREF g_GroupBoxColor = RGB(160, 160, 160);
 static COLORREF g_HeaderBackground = RGB(80, 80, 80);
@@ -167,6 +175,26 @@ static void UpdateMainMenuOwnerDraw(HWND hWnd) {
     if (changed) DrawMenuBar(hWnd);
 }
 
+// Safe window text retrieval with timeout to prevent deadlocks
+static bool SafeGetWindowText(HWND hWnd, wchar_t* buffer, int maxCount) {
+    if (!buffer || maxCount <= 0) return false;
+    buffer[0] = L'\0';
+    DWORD pid = 0;
+    if (GetWindowThreadProcessId(hWnd, &pid) == 0) return false;
+
+    DWORD_PTR res = 0;
+    if (SendMessageTimeoutW(hWnd, WM_GETTEXT, maxCount, (LPARAM)buffer, SMTO_ABORTIFHUNG | SMTO_NORMAL, 20, &res)) {
+        return true;
+    }
+    return false;
+}
+
+// Window validation helper
+static BOOL IsWindowValid(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return FALSE;
+    return (GetWindowThreadProcessId(hwnd, NULL) != 0);
+}
+
 static HBRUSH g_hbrMainBackground = NULL;
 static HBRUSH g_hbrChildBackground = NULL;
 static HBRUSH g_hbrEdit = NULL;
@@ -198,16 +226,19 @@ enum WndClass {
     WND_TRACKBAR,
     WND_MENU,
     WND_COMBOBOXEX,
-    WND_REAPERWINDOW
+    WND_REAPERWINDOW,
+    WND_CLICKPATTERN
 };
+
 enum class PreferredAppMode { Default, AllowDark, ForceDark, ForceLight, Max };
-using fnAllowDarkModeForWindow = bool (WINAPI*)(HWND hWnd, bool allow);
+using fnAllowDarkModeForWindow = bool(WINAPI*)(HWND hWnd, bool allow);
 using fnSetPreferredAppMode = PreferredAppMode(WINAPI*)(PreferredAppMode appMode);
-using fnFlushMenuThemes = void (WINAPI*)();
+using fnFlushMenuThemes = void(WINAPI*)();
 static fnAllowDarkModeForWindow AllowDarkModeForWindow = nullptr;
 static fnSetPreferredAppMode SetPreferredAppMode = nullptr;
 static fnFlushMenuThemes FlushMenuThemes = nullptr;
 static HHOOK g_hHook = NULL;
+static void UnstyleWindow(HWND hwnd);
 static void StyleWindow(HWND hwnd);
 static BOOL CALLBACK EnumAllChildren(HWND hwnd, LPARAM lParam);
 static BOOL IsChildOfTabControl(HWND hWnd);
@@ -216,33 +247,27 @@ static COLORREF GetWindowBgColor(HWND hWnd) {
     HWND root = GetAncestor(hWnd, GA_ROOT);
     if (root) {
         wchar_t title[256] = { 0 };
-        GetWindowTextW(root, title, 256);
-        if ((wcsstr(title, L"Save") && wcsstr(title, L"bounce") == NULL) ||
-            wcsstr(title, L"Open") || wcsstr(title, L"Import") ||
-            wcsstr(title, L"Export") || wcsstr(title, L"Browse") ||
-            wcsstr(title, L"Select")) {
+
+        // Use the structural property assigned by StyleWindow for system dialogs
+        if (GetPropW(root, L"IsFileDialog") != NULL) {
 
             wchar_t cls[256] = { 0 };
             GetClassNameW(hWnd, cls, 256);
 
-            // TreeView and ListView controls (retain native Explorer dark theme)
             if (wcscmp(cls, CLASSNAME_TREEVIEW) == 0 || wcscmp(cls, CLASSNAME_LISTVIEW) == 0) {
                 return RGB(25, 25, 25);
             }
 
-            // REAPER checkbox panel (hardcoded color RGB(56,56,56))
             if (wcscmp(cls, CLASSNAME_DIALOG) == 0 && hWnd != root) {
                 return RGB(56, 56, 56);
             }
 
-            // Checkbox controls inside panel (hardcoded RGB(56,56,56))
             HWND parent = GetParent(hWnd);
             if (parent != NULL && parent != root) {
-                wchar_t pCls[256]; GetClassNameW(parent, pCls, 256);
+                wchar_t pCls[256] = { 0 }; GetClassNameW(parent, pCls, 256);
                 if (wcscmp(pCls, CLASSNAME_DIALOG) == 0) return RGB(56, 56, 56);
             }
 
-            // Bottom area (Save/Cancel buttons): controlled by SystemWindowsColor
             return g_SystemWindowsColor;
         }
         return g_colorChild;
@@ -255,36 +280,30 @@ static HBRUSH GetWindowBgBrush(HWND hWnd) {
     HWND root = GetAncestor(hWnd, GA_ROOT);
     if (root) {
         wchar_t title[256] = { 0 };
-        GetWindowTextW(root, title, 256);
-        if ((wcsstr(title, L"Save") && wcsstr(title, L"bounce") == NULL) ||
-            wcsstr(title, L"Open") ||
-            wcsstr(title, L"Create new MIDI") ||
-            wcsstr(title, L"Render to file") ||//watch out for file-File!
-            wcsstr(title, L"Select replacement file") ||
-            wcsstr(title, L"Select new filename") ||
-            wcsstr(title, L"Import") ||
-            wcsstr(title, L"Export")) {
+
+        // Use safe retrieval instead of GetWindowTextW
+        SafeGetWindowText(root, title, 256);
+
+        // Use the structural property assigned by StyleWindow for system dialogs
+        if (GetPropW(root, L"IsFileDialog") != NULL) {
 
             wchar_t cls[256] = { 0 };
             GetClassNameW(hWnd, cls, 256);
 
-            // Explorer brush
             if (wcscmp(cls, CLASSNAME_TREEVIEW) == 0 || wcscmp(cls, CLASSNAME_LISTVIEW) == 0) {
                 static HBRUSH hbrExplorer = CreateSolidBrush(RGB(25, 25, 25));
                 return hbrExplorer;
             }
 
-            // HARD-CODED BRUSH (RGB(56,56,56))
             static HBRUSH hbrFixedTest = CreateSolidBrush(RGB(56, 56, 56));
-
             if (wcscmp(cls, CLASSNAME_DIALOG) == 0 && hWnd != root) return hbrFixedTest;
 
             HWND parent = GetParent(hWnd);
             if (parent != NULL && parent != root) {
-                wchar_t pCls[256]; GetClassNameW(parent, pCls, 256);
+                wchar_t pCls[256] = { 0 };
+                GetClassNameW(parent, pCls, 256);
                 if (wcscmp(pCls, CLASSNAME_DIALOG) == 0) return hbrFixedTest;
             }
-            // --------------------------------------
 
             return g_hbrSystemWindows;
         }
@@ -294,24 +313,7 @@ static HBRUSH GetWindowBgBrush(HWND hWnd) {
     return g_hbrMainBackground;
 }
 
-// Check if we are inside FX window (VST, AU, JS, ...)
-static BOOL IsInFXWindow(HWND hWnd) {
-    HWND root = GetAncestor(hWnd, GA_ROOT);
-    if (!root) return FALSE;
 
-    wchar_t rootTitle[256] = { 0 };
-    GetWindowTextW(root, rootTitle, 256);
-
-    // If the root window title contains these keywords, it is a plugin
-    if (wcsstr(rootTitle, L"VST:") ||
-        wcsstr(rootTitle, L"VST3:") ||
-        wcsstr(rootTitle, L"JS:") ||
-        wcsstr(rootTitle, L"AU:") ||
-        wcsstr(rootTitle, L"FX: ")) {
-        return TRUE;
-    }
-    return FALSE;
-}
 
 static VOID CALLBACK UncloakTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime) {
     KillTimer(hwnd, idEvent);
@@ -432,6 +434,52 @@ static void EnsureBrushesAreAlive() {
     }
 }
 
+// -----------------------------------------------------------------------------
+// CUSTOM PAINT SUBCLASS FOR FAKE SYSLINKS (Reaper Link Buttons)
+// -----------------------------------------------------------------------------
+static LRESULT CALLBACK FakeSysLinkSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
+    if (uMsg == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+
+        RECT rc;
+        GetClientRect(hWnd, &rc);
+
+        // Dynamically match the parent's background color for a seamless blend
+        HWND hParent = GetParent(hWnd);
+        COLORREF bgColor = GetWindowBgColor(hParent);
+        HBRUSH bgBrush = CreateSolidBrush(bgColor);
+        FillRect(hdc, &rc, bgBrush);
+        DeleteObject(bgBrush);
+
+        int len = GetWindowTextLengthW(hWnd);
+        if (len > 0) {
+            wchar_t* text = new wchar_t[len + 1];
+            GetWindowTextW(hWnd, text, len + 1);
+
+            SetBkMode(hdc, TRANSPARENT);
+            // Inject our readable light blue color for Dark Mode
+            SetTextColor(hdc, RGB(0, 150, 255));
+            // Ensure we use REAPER's UI font
+            HFONT hFont = (HFONT)SendMessageW(hWnd, WM_GETFONT, 0, 0);
+            HFONT hOldFont = (HFONT)SelectObject(hdc, hFont);
+
+            // Draw text aligned to the left and vertically centered
+            DrawTextW(hdc, text, -1, &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            SelectObject(hdc, hOldFont);
+            delete[] text;
+        }
+
+        EndPaint(hWnd, &ps);
+        return 0; // Signal that we completely handled the painting
+    }
+    else if (uMsg == WM_NCDESTROY) {
+        RemoveWindowSubclass(hWnd, FakeSysLinkSubclassProc, uIdSubclass);
+        RemovePropW(hWnd, L"SubclassedAsLink");
+    }
+
+    return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+}
 
 static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
     LRESULT lr = 0;
@@ -449,9 +497,10 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
     if (uMsg == WM_NOTIFY) {
         LPNMHDR nmhdr = (LPNMHDR)lParam;
         if (nmhdr->code == NM_CUSTOMDRAW) {
-            wchar_t clsName[256];
+            wchar_t clsName[256] = { 0 };
             GetClassNameW(nmhdr->hwndFrom, clsName, 256);
 
+            // --- LEFT SIDE (TreeView - FX) ---
             if (wcscmp(clsName, CLASSNAME_TREEVIEW) == 0) {
                 LPNMTVCUSTOMDRAW ptvcd = (LPNMTVCUSTOMDRAW)lParam;
                 if (ptvcd->nmcd.dwDrawStage == CDDS_PREPAINT) {
@@ -460,8 +509,11 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                 }
                 else if (ptvcd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
                     bool isSelected = (ptvcd->nmcd.uItemState & (CDIS_SELECTED | CDIS_FOCUS | CDIS_DROPHILITED)) != 0;
+
                     if (isSelected) {
                         ptvcd->clrText = g_TreeSelectionTextColor;
+
+                        // CRITICAL: Don't color background!
                     }
                     else {
                         ptvcd->clrText = g_TextColor;
@@ -469,6 +521,7 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                     return CDRF_NEWFONT;
                 }
             }
+            // --- RIGHT SIDE: General lists (ListView - Actions, FX seznami) ---
             else if (wcscmp(clsName, CLASSNAME_LISTVIEW) == 0) {
                 LPNMLVCUSTOMDRAW plvcd = (LPNMLVCUSTOMDRAW)lParam;
 
@@ -479,23 +532,23 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                 else if (plvcd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
                     bool isSelected = (plvcd->nmcd.uItemState & (CDIS_SELECTED | CDIS_FOCUS | CDIS_DROPHILITED)) != 0;
 
-                    COLORREF bgColor = GetWindowBgColor(nmhdr->hwndFrom);
-                    plvcd->clrTextBk = bgColor;
-
                     if (isSelected) {
-                        plvcd->clrText = g_TreeSelectionTextColor;
+                        // Let the OS draw the default selection highlight and text color.
+                        return CDRF_DODEFAULT;
                     }
                     else {
+                        // Apply custom text color and background for unselected items.
+                        COLORREF bgColor = GetWindowBgColor(nmhdr->hwndFrom);
+                        plvcd->clrTextBk = bgColor;
                         plvcd->clrText = g_TextColor;
+                        return CDRF_NEWFONT;
                     }
-
-                    return CDRF_NEWFONT;
                 }
             }
         }
     }
 
-    wchar_t className[256];
+    wchar_t className[256] = { 0 };
     GetClassName(hWnd, className, 256);
 
     WndClass classType = (WndClass)dwRefData;
@@ -512,8 +565,6 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
         }
     }
 
-
-
     if (classType == WND_BUTTON) {
         if (uMsg == WM_SETTEXT || uMsg == BM_SETCHECK || uMsg == BM_SETSTATE) {
             // CHECKBOX PROTECTION BLOCK
@@ -528,12 +579,10 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
     }
 
     bool isColorDlg = false;
-    bool isPinConnector = false;
 
     HWND root = GetAncestor(hWnd, GA_ROOT);
     if (root) {
         if (GetPropW(root, L"IsColorDlg") != NULL) isColorDlg = true;
-        if (GetPropW(root, L"IsPinConnector") != NULL) isPinConnector = true;
     }
 
     // FULLSCREEN MENU
@@ -602,43 +651,67 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                 return TRUE;
             }
         }
+        // --- THEME TWEAKER (LISTBOX GRID) ---
+        else if (dis->CtlType == ODT_LISTBOX) {
+            LRESULT res = DefSubclassProc(hWnd, uMsg, wParam, lParam);
+
+            HPEN hPen = CreatePen(PS_SOLID, 1, g_BorderColor);
+
+            HBRUSH hOldBrush = (HBRUSH)SelectObject(dis->hDC, GetStockObject(NULL_BRUSH));
+            HPEN hOldPen = (HPEN)SelectObject(dis->hDC, hPen);
+
+            Rectangle(dis->hDC, dis->rcItem.left, dis->rcItem.top, dis->rcItem.right, dis->rcItem.bottom);
+
+            SelectObject(dis->hDC, hOldPen);
+            SelectObject(dis->hDC, hOldBrush);
+            DeleteObject(hPen);
+
+            return res;
+        }
     }
 
-    // 1. TEST FOR COLOR PICKER
+    // TEST FOR COLOR PICKER AND SENSITIVE WINDOWS
     if (uMsg == WM_INITDIALOG || uMsg == WM_SHOWWINDOW) {
         if (wcscmp(className, CLASSNAME_DIALOG) == 0) {
             wchar_t title[256] = { 0 };
             GetWindowTextW(hWnd, title, 256);
 
-            // Structural detection heuristic for Color Picker and similar dialogs
+            // Structural detection heuristic for Color Picker
             bool isColorStruct = (GetDlgItem(hWnd, 712) != NULL);
-            if (isColorStruct ||
-                wcsstr(title, L"Notes") || wcsstr(title, L"Screenset") ||
-                wcsstr(title, L"Customize menus") || wcsstr(title, L"Customise menus") ||
-                wcsstr(title, L"toolbar icon") || wcsstr(title, L"Toolbar Icon") ||
-                wcsstr(title, L"Icon")) {
 
+
+            // Structural detection heuristic for "Customize menus"
+            bool isCustomizeMenus = (GetDlgItem(hWnd, 0x05FE) != NULL &&
+                GetDlgItem(hWnd, 0x05FA) != NULL &&
+                GetDlgItem(hWnd, 0x060D) != NULL);
+
+            // Structural detection heuristic for "Select toolbar icon"
+            bool isToolbarIcon = (GetDlgItem(hWnd, 0x03EF) != NULL &&
+                GetDlgItem(hWnd, 0x03F1) != NULL &&
+                GetDlgItem(hWnd, 0x0420) != NULL &&
+                GetDlgItem(hWnd, 0x0710) == NULL &&
+                GetDlgItem(hWnd, 0x0685) == NULL);
+
+            // Structural detection heuristic for Metronomome
+            bool hasClickPattern = (FindWindowExW(hWnd, NULL, L"REAPERClickPatternEdit", NULL) != NULL);
+
+            // Protect sensitive windows from being fully painted over (exclude Metronome!)
+            if ((isColorStruct || isCustomizeMenus || isToolbarIcon) && !hasClickPattern) {
                 SetPropW(hWnd, L"IsColorDlg", (HANDLE)1);
                 isColorDlg = true;
-            }
-
-            if (wcsstr(title, L"pin connector") || wcsstr(title, L"Pin connector") || wcsstr(title, L"Plug-in pin")) {
-                SetPropW(hWnd, L"IsPinConnector", (HANDLE)1);
-                isPinConnector = true;
             }
         }
     }
 
     if (uMsg == WM_SHOWWINDOW && wParam == TRUE) {
         if (wcscmp(className, CLASSNAME_DIALOG) == 0) {
-            if (!isColorDlg && !isPinConnector) {
+            if (!isColorDlg) {
                 EnableThemeDialogTexture(hWnd, ETDT_DISABLE);
             }
         }
 
         HWND root = GetAncestor(hWnd, GA_ROOT);
         if (hWnd == root) {
-
             int curtainDelay = 1;// global minimal delay to prevent system dialog flicker
 
             wchar_t rootTitle[256] = { 0 };
@@ -669,26 +742,16 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
             }
         }
 
-        // Prevent a full refresh of all elements when the MIDI editor is displayed.
-        // NOTE: Envelope tables are themable via Theme Tweaker
-        // Exception for "Envelopes", so the window doesn't stay white if the take (Take) has "MIDI" in its name!
-        wchar_t wndTitle[256] = { 0 };
-        GetWindowTextW(hWnd, wndTitle, 256);
+        // Prevent a full refresh of all elements when the MIDI editor is displayed
+        wchar_t wndClass[256] = { 0 };
+        GetClassNameW(hWnd, wndClass, 256);
 
-        bool hasMidi = (wcsstr(wndTitle, L"MIDI") != NULL);
-        bool isEnvelopesWindow = (wcsstr(wndTitle, L"Envelopes") != NULL);
+        bool isMidiEditor = (wcscmp(wndClass, L"REAPERmidieditorwnd") == 0);
 
-        //Refresh elements if THIS IS NOT a Midi window, OR if it is specifically the Envelopes window
-        if (!hasMidi || isEnvelopesWindow) {
+        // Refresh elements natively if THIS IS NOT the MIDI editor window
+        if (!isMidiEditor) {
             EnumChildWindows(hWnd, EnumAllChildren, 0);
         }
-    }
-
-    if (isPinConnector) {
-        if (uMsg == WM_NCDESTROY) {
-            RemoveWindowSubclass(hWnd, UniversalSubclassProc, uIdSubclass);
-        }
-        return DefSubclassProc(hWnd, uMsg, wParam, lParam);
     }
 
     if (uMsg == WM_ENABLE) {
@@ -731,8 +794,76 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
         }
     }
 
+    // --- CUSTOM THIN BORDER FOR LISTVIEWS AND TREEVIEWS ---
+    if (uMsg == WM_NCPAINT) {
+        if (classType == WND_LISTVIEW || classType == WND_TREEVIEW) {
+            // Let Windows draw the default 3D scrollbars and edges first
+            LRESULT res = DefSubclassProc(hWnd, uMsg, wParam, lParam);
+
+            // Get the Device Context for the ENTIRE window (including non-client area)
+            HDC hdc = GetWindowDC(hWnd);
+            RECT rc;
+            GetWindowRect(hWnd, &rc);
+            OffsetRect(&rc, -rc.left, -rc.top); // Normalize coordinates to 0,0
+
+            HBRUSH hOldBrush = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH)); // Hollow brush
+
+            // 1. Outer border (1px) - apply our custom border color
+            HPEN hPenBorder = CreatePen(PS_SOLID, 1, g_BorderColor);
+            HPEN hOldPen = (HPEN)SelectObject(hdc, hPenBorder);
+            Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom);
+
+            // 2. Inner border (1px) - blend with the control's background to make the border look 1px thin
+            COLORREF bgColor = GetWindowBgColor(hWnd);
+            HPEN hPenBg = CreatePen(PS_SOLID, 1, bgColor);
+            SelectObject(hdc, hPenBg);
+            Rectangle(hdc, rc.left + 1, rc.top + 1, rc.right - 1, rc.bottom - 1);
+
+            // Cleanup
+            SelectObject(hdc, hOldPen);
+            SelectObject(hdc, hOldBrush);
+            DeleteObject(hPenBorder);
+            DeleteObject(hPenBg);
+            ReleaseDC(hWnd, hdc);
+
+            return res;
+        }
+    }
+    // ------------------------------------------------------
+
     if (uMsg == WM_PAINT) {
         HWND rootTemp = GetAncestor(hWnd, GA_ROOT);
+
+        // HYBRID DARK/LIGHT WINDOW "CONFIRM SAVE AS" --- 
+        // We detect the window by title and strip the dark theme from the content
+        // while re-applying the dark title bar for a consistent UI look.
+        wchar_t wndTitle[256] = { 0 };
+        SafeGetWindowText(hWnd, wndTitle, 256);
+
+        if (wcscmp(wndTitle, L"Confirm Save As") == 0) {
+            if (GetPropW(hWnd, L"HybridStyled") == NULL) {
+                SetPropW(hWnd, L"HybridStyled", (HANDLE)1);
+
+                // 1. Remove the custom Dark Mode theme from the window content
+                SetWindowTheme(hWnd, NULL, NULL);
+
+                // 2. Remove our subclassing from child buttons to make them light again
+                EnumChildWindows(hWnd, [](HWND hChild, LPARAM lp) -> BOOL {
+                    RemoveWindowSubclass(hChild, UniversalSubclassProc, 1);
+                    RemoveWindowSubclass(hChild, UniversalSubclassProc, 3);
+                    SetWindowTheme(hChild, NULL, NULL);
+                    return TRUE;
+                    }, 0);
+
+                // 3. Re-force the dark title bar via DWM (crucial after theme reset)
+                DarkenTitleBar(hWnd);
+
+                // Refresh to apply changes immediately
+                InvalidateRect(hWnd, NULL, TRUE);
+                return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+            }
+        }
+        // ------------------------------------------------
 
         // PROTECTION: If we are in the Color Picker, the OS MUST draw the squares!
         // Ignore all elements except lists.
@@ -798,7 +929,7 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
         }
 
         if (classType == WND_HEADER) {
-            PAINTSTRUCT ps;
+            PAINTSTRUCT ps = { 0 };
             HDC hdc = BeginPaint(hWnd, &ps);
 
             RECT rcClient;
@@ -943,6 +1074,7 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                 RECT rc; GetClientRect(hWnd, &rc);
                 LRESULT result = DefSubclassProc(hWnd, uMsg, wParam, lParam);
                 wchar_t text[256] = { 0 };
+
                 GetWindowTextW(hWnd, text, 256);
                 HFONT hFont = (HFONT)SendMessageW(hWnd, WM_GETFONT, 0, 0);
                 HFONT hOldFont = (HFONT)SelectObject(hdc, hFont);
@@ -1005,24 +1137,38 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
             return 0;
         }
         else if (classType == WND_DIALOG || IsChildOfTabControl(hWnd)) {
-            PAINTSTRUCT ps;
+            PAINTSTRUCT ps = { 0 };
             HDC hdc = BeginPaint(hWnd, &ps);
             HBRUSH bgBrush = GetWindowBgBrush(hWnd);
             FillRect(hdc, &ps.rcPaint, bgBrush);
             EndPaint(hWnd, &ps);
             return 0;
         }
+        else if (classType == WND_CLICKPATTERN) {
+            // 1. Let REAPER draw its original white grid and black dots first
+            LRESULT res = DefSubclassProc(hWnd, uMsg, wParam, lParam);
+
+            // 2. Grab the drawn canvas and invert its colors instantly
+            HDC hdc = GetDC(hWnd);
+            RECT rc = { 0 };
+            GetClientRect(hWnd, &rc);
+
+            // DSTINVERT turns white into black, and black into white
+            BitBlt(hdc, 0, 0, rc.right, rc.bottom, hdc, 0, 0, DSTINVERT);
+
+            ReleaseDC(hWnd, hdc);
+            return res;
+        }
     }
 
     if (uMsg == WM_CTLCOLORDLG || uMsg == WM_CTLCOLORMSGBOX) {
         HWND hDlg = (HWND)lParam;
+
         // LET THE DIALOG BACKGROUND BE DARK
         return (LRESULT)(GetWindowBgBrush(hDlg));
     }
     else if (uMsg == WM_CTLCOLORSTATIC || uMsg == WM_CTLCOLORBTN) {
-
         // KEEP COLOR SWATCHES NATIVE IN COLOR PICKER! (Prevents them from turning gray)
-        //if (isColorDlg) return DefSubclassProc(hWnd, uMsg, wParam, lParam);
         if (isColorDlg && uMsg == WM_CTLCOLORSTATIC) return DefSubclassProc(hWnd, uMsg, wParam, lParam);
 
         HDC hdc = (HDC)wParam;
@@ -1032,15 +1178,26 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
         HBRUSH bgBrush = GetWindowBgBrush(hWnd);
 
         wchar_t childClass[256];
-        GetClassName(hCtrl, childClass, 256);
+        GetClassNameW(hCtrl, childClass, 256);
 
         DWORD btnStyle = GetWindowLong(hCtrl, GWL_STYLE) & BS_TYPEMASK;
         bool isStandardButton = (wcscmp(childClass, L"Button") == 0 &&
             (btnStyle == BS_PUSHBUTTON || btnStyle == BS_DEFPUSHBUTTON));
 
+        // --- FAKE LINK BACKGROUND HANDLING ---
+        bool isCheckBox = (wcscmp(childClass, L"Button") == 0 && (btnStyle == BS_CHECKBOX || btnStyle == BS_AUTOCHECKBOX || btnStyle == BS_3STATE || btnStyle == BS_AUTO3STATE));
+        bool isRadio = (wcscmp(childClass, L"Button") == 0 && (btnStyle == BS_RADIOBUTTON || btnStyle == BS_AUTORADIOBUTTON));
+        bool isGroupBox = (wcscmp(childClass, L"Button") == 0 && (btnStyle == BS_GROUPBOX));
+
+        if (wcscmp(childClass, L"Button") == 0 && !isStandardButton && !isCheckBox && !isRadio && !isGroupBox) {
+            // Already subclassed in StyleWindow, just return transparent background.
+            SetBkMode(hdc, TRANSPARENT);
+            return (LRESULT)bgBrush;
+        }
+        // ----------------------------------------------------
+
         // Protection against embossing only for genuine Static text and checkboxes/radio buttons!
-        // Do not interfere with manual painting of standard buttons (e.g., ReaInsert).
-        if ((!IsWindowEnabled(hCtrl) || GetProp(hCtrl, L"FakeDisabled")) && !isStandardButton) {
+        if ((!IsWindowEnabled(hCtrl) || GetPropW(hCtrl, L"FakeDisabled") != NULL) && !isStandardButton) {
             SetTextColor(hdc, g_DisabledTextColor);
             SetBkColor(hdc, bgColor);
             SetBkMode(hdc, OPAQUE);
@@ -1048,9 +1205,8 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
         }
 
         if (wcscmp(childClass, L"SysLink") == 0) {
-            SetTextColor(hdc, RGB(100, 180, 255));
+            SetTextColor(hdc, RGB(0, 150, 255));
         }
-        // Do not force white text if it's a standard button (e.g., ReaInsert).
         else if (!isStandardButton) {
             SetTextColor(hdc, g_TextColor);
         }
@@ -1076,14 +1232,15 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
         SetBkMode(hdc, OPAQUE);
         return (LRESULT)g_hbrEdit;
     }
+
     if (uMsg == WM_NCDESTROY) {
         RemovePropW(hWnd, L"FakeDisabled");
         RemovePropW(hWnd, L"IsColorDlg");
-        RemovePropW(hWnd, L"IsPinConnector");
         RemoveWindowSubclass(hWnd, UniversalSubclassProc, uIdSubclass);
     }
     return DefSubclassProc(hWnd, uMsg, wParam, lParam);
 }
+
 static WndClass GetWindowClassType(const wchar_t* className) {
     if (wcscmp(className, CLASSNAME_DIALOG) == 0) return WND_DIALOG;
     if (wcscmp(className, CLASSNAME_BUTTON) == 0) return WND_BUTTON;
@@ -1102,11 +1259,17 @@ static WndClass GetWindowClassType(const wchar_t* className) {
     if (wcscmp(className, CLASSNAME_TRACKBAR) == 0) return WND_TRACKBAR;
     if (wcscmp(className, CLASSNAME_MENU) == 0) return WND_MENU;
     if (wcscmp(className, CLASSNAME_COMBOBOXEX) == 0) return WND_COMBOBOXEX;
+    if (wcscmp(className, L"REAPERClickPatternEdit") == 0) return WND_CLICKPATTERN;
     if (wcsncmp(className, CLASSNAME_REAPER_PREFIX, 6) == 0) return WND_REAPERWINDOW;
     return WND_UNKNOWN;
 }
 
 static void StyleWindow(HWND hwnd) {
+    // Validation at the very start
+    if (!IsWindowValid(hwnd)) {
+        return;  // Exit if window is invalid
+    }
+
     wchar_t className[256] = { 0 };
     if (!GetClassNameW(hwnd, className, 256)) return;
 
@@ -1114,12 +1277,13 @@ static void StyleWindow(HWND hwnd) {
     if (wcscmp(className, CLASSNAME_MENU) == 0) return;
 
     // --- PROTECT FLOATING OVERLAYS (MIDI Razor Edit) ---
-    // Floating overlay windows usually have no title and are WS_POPUP (not tied to a frame).
     LONG wndStyle = GetWindowLong(hwnd, GWL_STYLE);
     if ((wndStyle & WS_POPUP) && !(wndStyle & WS_CAPTION)) {
         wchar_t wndTitle[256] = { 0 };
-        GetWindowTextW(hwnd, wndTitle, 256);
-        // If it has no title, skip it (likely an external DLL overlay)
+
+        // Safe title check for floating windows
+        SafeGetWindowText(hwnd, wndTitle, 256);
+
         if (wcslen(wndTitle) == 0) {
             return;
         }
@@ -1127,6 +1291,16 @@ static void StyleWindow(HWND hwnd) {
     // ---------------------------------------------------
 
     HWND root = GetAncestor(hwnd, GA_ROOT);
+
+    // --- HYBRID DIALOG CHECK (Confirm Save As) ---
+    // If the root window is tagged for hybrid styling, skip dark mode for content
+    if (root && GetPropW(root, L"IsHybridWindow") != NULL) {
+        // We still allow the title bar to be darkened in StyleWindow logic
+        if (hwnd == root) {
+            DarkenTitleBar(hwnd);
+        }
+        return; // Skip further dark subclassing for the window and its children
+    }
 
     // --- SMART DETECTION "SAVE/OPEN" WND ---
     bool isFileDialog = false;
@@ -1181,7 +1355,7 @@ static void StyleWindow(HWND hwnd) {
         DarkenTitleBar(hwnd);
 
         // UNIVERSAL FIX FOR ALL MENUS (Including Media Explorer):
-        // If Windows reports that this window has a system menu (GetMenu), 
+        // If Windows reports that this window has a system menu (GetMenu),
         // we must subclass it to trigger UAHMenuBar for the dark theme!
         if (GetMenu(hwnd) != NULL) {
             SetWindowTheme(hwnd, L"DarkMode_Explorer", NULL);
@@ -1189,30 +1363,11 @@ static void StyleWindow(HWND hwnd) {
             UpdateMainMenuOwnerDraw(hwnd);
         }
 
-        // Additional protection for REAPER-specific windows
-        wchar_t title[256] = { 0 };
-        GetWindowTextW(hwnd, title, 256);
-        if (wcsstr(title, L"MIDI") != NULL || wcsstr(title, L"Media Explorer") != NULL || wcsstr(title, L"Media explorer") != NULL) {
+        // Force UAH dark menubar for specific floating REAPER windows
+        if (wcscmp(className, L"REAPERmidieditorwnd") == 0 || wcscmp(className, L"REAPERMediaExplorerMainwnd") == 0) {
             SetWindowTheme(hwnd, L"DarkMode_Explorer", NULL);
             SetWindowSubclass(hwnd, UniversalSubclassProc, 1, (DWORD_PTR)GetWindowClassType(className));
         }
-    }
-
-    bool isPin = false;
-    if (root) {
-        wchar_t rootTitle[256] = { 0 };
-        GetWindowTextW(root, rootTitle, 256);
-        if (wcsstr(rootTitle, L"pin connector") || wcsstr(rootTitle, L"Pin connector") || wcsstr(rootTitle, L"Plug-in pin")) {
-            SetPropW(root, L"IsPinConnector", (HANDLE)1);
-            isPin = true;
-        }
-        else if (GetPropW(root, L"IsPinConnector") != NULL) {
-            isPin = true;
-        }
-    }
-
-    if (isPin) {
-        return;
     }
 
     if (GetPropW(hwnd, L"IsColorDlg") != NULL) {
@@ -1225,16 +1380,14 @@ static void StyleWindow(HWND hwnd) {
 
     // Capture "REAPERwnd" as well as floating windows ("REAPERdocker")
     if (wcsncmp(className, CLASSNAME_REAPER_PREFIX, 6) == 0) {
-
         // --- SHIELD FOR MIDI CHILD WINDOWS ---
         if (root) {
-            wchar_t rootTitle[256] = { 0 };
-            GetWindowTextW(root, rootTitle, 256);
+            wchar_t rootClass[256] = { 0 };
+            GetClassNameW(root, rootClass, 256);
 
-            // If we are inside the MIDI editor and this is a child window (starts with REAPER)
-            // we simply skip it and do not apply dark mode / subclassing.
-            if (wcsstr(rootTitle, L"MIDI") != NULL && hwnd != root) {
-                return; // Abort function, leave the window alone!
+            // Skip custom styling for internal MIDI editor elements to preserve native piano roll drawing
+            if (wcscmp(rootClass, L"REAPERmidieditorwnd") == 0 && hwnd != root) {
+                return;
             }
         }
         // -------------------------------------
@@ -1250,28 +1403,39 @@ static void StyleWindow(HWND hwnd) {
     }
     else if (wcscmp(className, CLASSNAME_BUTTON) == 0) {
         DWORD style = GetWindowLong(hwnd, GWL_STYLE) & BS_TYPEMASK;
-        if (style == BS_GROUPBOX) {
-            HWND rootWindow = GetAncestor(hwnd, GA_ROOT);
-            wchar_t windowTitle[256] = { 0 };
-            GetWindowTextW(rootWindow, windowTitle, 256);
 
-            if (wcsstr(windowTitle, L"Preferences") ||
-                wcsstr(windowTitle, L"Audio") ||
-                wcsstr(windowTitle, L"Device") ||
-                wcsstr(windowTitle, L"Settings")) {
-                return;
+        bool isStandardButton = (style == BS_PUSHBUTTON || style == BS_DEFPUSHBUTTON);
+        bool isCheckBox = (style == BS_CHECKBOX || style == BS_AUTOCHECKBOX || style == BS_3STATE || style == BS_AUTO3STATE);
+        bool isRadio = (style == BS_RADIOBUTTON || style == BS_AUTORADIOBUTTON);
+        bool isGroupBox = (style == BS_GROUPBOX);
+
+        // --- FAKE LINK RECOGNITION (Early Subclassing) ---
+        // Catch the fake links immediately when the window is styled, before any painting occurs.
+        if (!isStandardButton && !isCheckBox && !isRadio && !isGroupBox) {
+            if (!GetPropW(hwnd, L"SubclassedAsLink")) {
+                SetPropW(hwnd, L"SubclassedAsLink", (HANDLE)1);
+                SetWindowSubclass(hwnd, FakeSysLinkSubclassProc, 10101, 0);
+            }
+        }
+        else if (isGroupBox) {
+            HWND rootWindow = GetAncestor(hwnd, GA_ROOT);
+
+            // Structural detection for Preferences/Settings window
+            bool isPreferencesWindow = (GetDlgItem(rootWindow, 0x0456) != NULL &&
+                GetDlgItem(rootWindow, 0x0520) != NULL &&
+                GetDlgItem(rootWindow, 0x051F) != NULL);
+
+            if (isPreferencesWindow) {
+                return; // Skip styling GroupBoxes inside the Preferences window
             }
             SetWindowTheme(hwnd, L"", L"");
             SetWindowSubclass(hwnd, UniversalSubclassProc, 2, (DWORD_PTR)GetWindowClassType(className));
         }
-        else if (style == BS_RADIOBUTTON || style == BS_AUTORADIOBUTTON ||
-            style == BS_CHECKBOX || style == BS_AUTOCHECKBOX ||
-            style == BS_3STATE || style == BS_AUTO3STATE) {
+        else if (isCheckBox || isRadio) {
             SetWindowTheme(hwnd, L"DarkMode_Explorer", NULL);
             SetWindowSubclass(hwnd, UniversalSubclassProc, 3, (DWORD_PTR)GetWindowClassType(className));
         }
-
-        else if (style == BS_PUSHBUTTON || style == BS_DEFPUSHBUTTON) {
+        else if (isStandardButton) {
             SetWindowTheme(hwnd, L"DarkMode_Explorer", NULL);
             // VERY IMPORTANT: DO NOT call SubclassProc here!
             // This prevents our WM_PAINT function from breaking the rendering of these buttons.
@@ -1318,15 +1482,21 @@ static void StyleWindow(HWND hwnd) {
     // ComboBoxes retain the old theme (this prevents those white borders in FX windows and settings!)
     else if (wcscmp(className, CLASSNAME_COMBOBOX) == 0) {
         SetWindowTheme(hwnd, L"DarkMode_CFD", NULL);
-        // Prevent automatic text selection in comboboxes on window open
-        PostMessage(hwnd, CB_SETEDITSEL, 0, MAKELPARAM(-1, 0));
+
+        // --- FX BROWSER SEARCH AUTO-SELECT FIX ---
+        // We detect the FX Filter search box using its Control ID (0x473).
+        // If it's the search box, we SKIP the de-selection so users can type immediately.
+        // For all other ComboBoxes, we clear the selection to keep the UI clean.
+        int ctrlId = GetDlgCtrlID(hwnd);
+        if (ctrlId != 0x473) {
+            PostMessage(hwnd, CB_SETEDITSEL, 0, MAKELPARAM(-1, 0));
+        }
     }
     // Smartly separate Edit fields
     else if (wcscmp(className, CLASSNAME_EDIT) == 0) {
         DWORD style = GetWindowLong(hwnd, GWL_STYLE);
 
         if ((style & WS_VSCROLL) || (style & ES_MULTILINE)) {
-
             SetWindowTheme(hwnd, L"DarkMode_Explorer", NULL);
 
             // remove WS_EX_CLIENTEDGE thick border
@@ -1389,10 +1559,10 @@ static void StyleWindow(HWND hwnd) {
         SetWindowTheme(hwnd, L"DarkMode_Explorer", NULL);
         SetWindowSubclass(hwnd, UniversalSubclassProc, 4, (DWORD_PTR)GetWindowClassType(className));
     }
+
     if (wcscmp(className, CLASSNAME_EDIT) != 0 &&
         wcscmp(className, CLASSNAME_COMBOBOX) != 0 &&
         wcscmp(className, CLASSNAME_COMBOBOXEX) != 0) {
-
         SendMessage(hwnd, WM_THEMECHANGED, 0, 0);
     }
 }
@@ -1464,6 +1634,7 @@ static void LoadConfig() {
         DeleteObject(g_menuBarBgBrush);
         g_menuBarBgBrush = NULL;
     }
+
     g_menuBgColor = ReadColorFromIni(g_IniPath.c_str(), L"MenuBarBackground", g_menuBgColor);
     g_menuTextColor = ReadColorFromIni(g_IniPath.c_str(), L"MenuTextColor", g_menuTextColor);
     g_menuTextDisabledColor = ReadColorFromIni(g_IniPath.c_str(), L"DisabledTextColor", g_menuTextDisabledColor);
@@ -1548,6 +1719,7 @@ static void UnstyleWindow(HWND hwnd) {
                 menuChanged = true;
             }
         }
+
         // Remove the background color
         MENUINFO mi = { sizeof(MENUINFO) };
         mi.fMask = MIM_BACKGROUND;
@@ -1567,22 +1739,18 @@ static VOID CALLBACK CheckIniTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, D
 
     FILETIME newTime = GetFileWriteTime(g_IniPath);
     if (CompareFileTime(&newTime, &g_LastIniTime) > 0) {
-
         LoadConfig();
 
         bool stateChanged = (g_bIsEnabled != g_LastEnabledState);
         g_LastEnabledState = g_bIsEnabled;
 
-        // Enable or disable global APIs and Hooks
         if (stateChanged) {
             if (g_bIsEnabled) {
-                // Enable
                 if (SetPreferredAppMode) SetPreferredAppMode(PreferredAppMode::ForceDark);
                 if (FlushMenuThemes) FlushMenuThemes();
                 if (!g_hHook) g_hHook = SetWindowsHookEx(WH_CBT, CBTProc, NULL, GetCurrentThreadId());
             }
             else {
-                // Disable
                 if (SetPreferredAppMode) SetPreferredAppMode(PreferredAppMode::Default);
                 if (FlushMenuThemes) FlushMenuThemes();
                 if (g_hHook) {
@@ -1592,10 +1760,15 @@ static VOID CALLBACK CheckIniTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, D
             }
         }
 
-        // Iterate through all windows to update the interface
         DWORD pid = GetCurrentProcessId();
         HWND topHwnd = GetTopWindow(GetDesktopWindow());
         while (topHwnd) {
+            // Validate window handle before processing
+            if (!IsWindowValid(topHwnd)) {
+                topHwnd = GetWindow(topHwnd, GW_HWNDNEXT);
+                continue;  // Skip invalid windows
+            }
+
             DWORD wpid;
             GetWindowThreadProcessId(topHwnd, &wpid);
             if (wpid == pid) {
@@ -1609,11 +1782,9 @@ static VOID CALLBACK CheckIniTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, D
                     }
                 }
                 else if (g_bIsEnabled) {
-                    // Only refresh colors if the window remains in Dark Mode
                     DarkenTitleBar(topHwnd);
                 }
 
-                // Forcibly repaint the window, including the frame
                 RedrawWindow(topHwnd, NULL, NULL, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW | RDW_FRAME);
             }
             topHwnd = GetWindow(topHwnd, GW_HWNDNEXT);
@@ -1622,13 +1793,40 @@ static VOID CALLBACK CheckIniTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, D
 }
 
 extern "C" __declspec(dllexport) int ReaperPluginEntry(void* r, void* v) {
-    if (r) {
+    if (v && r) {
+        REAPER_PLUGIN_INFO* rec = (REAPER_PLUGIN_INFO*)v;
+
+        // Load specific REAPER API functions
+        void (*SetThemeColor)(const char*, int, int) = (void (*)(const char*, int, int))rec->GetFunc("SetThemeColor");
+        void (*ThemeLayout_RefreshAll)() = (void (*)())rec->GetFunc("ThemeLayout_RefreshAll");
+
         LoadConfig();
 
         // SYNC STATE: Ensure timer logic knows the correct initial state
         g_LastEnabledState = g_bIsEnabled;
 
         InitDarkApi();
+
+        // --- SILENTLY APPLY THEME COLORS ON STARTUP ---
+        // If the plugin is enabled and we have the REAPER API functions loaded, apply the RAM color overrides
+        int syncInt = GetPrivateProfileIntW(L"Settings", L"SyncThemeColors", 0, g_IniPath.c_str());
+        if (g_bIsEnabled && syncInt == 1 && SetThemeColor && ThemeLayout_RefreshAll) {
+
+            // Note: COLORREF on Windows perfectly matches REAPER's native color integer
+            // 1. Sync Backgrounds (ColorChild)
+            SetThemeColor("col_main_bg", (int)g_colorChild, 0);
+            SetThemeColor("window_bg", (int)g_colorChild, 0);
+            SetThemeColor("col_main_editbk", (int)g_colorChild, 0);
+
+            // 2. Sync Gridlines
+            COLORREF gridColor = ReadColorFromIni(g_IniPath.c_str(), L"GridLinesColor", RGB(60, 60, 60));
+            SetThemeColor("genlist_grid", (int)gridColor, 0);
+            SetThemeColor("midieditorlist_grid", (int)gridColor, 0);
+            SetThemeColor("explorer_grid", (int)gridColor, 0);
+
+            ThemeLayout_RefreshAll();
+        }
+        // ----------------------------------------------
 
         // Only apply initial styling and hooks if enabled in INI
         if (g_bIsEnabled) {
@@ -1643,6 +1841,7 @@ extern "C" __declspec(dllexport) int ReaperPluginEntry(void* r, void* v) {
                 }
                 hwnd = GetWindow(hwnd, GW_HWNDNEXT);
             }
+
             g_hHook = SetWindowsHookEx(WH_CBT, CBTProc, NULL, GetCurrentThreadId());
         }
 
@@ -1653,6 +1852,7 @@ extern "C" __declspec(dllexport) int ReaperPluginEntry(void* r, void* v) {
         }
         return 1;
     }
+
     return 0;
 }
 
@@ -1663,7 +1863,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         break;
     case DLL_PROCESS_DETACH:
         // WARNING: Do not call FindWindow, KillTimer, or UnhookWindowsHookEx here!
-        // Doing so causes a deadlock and leaves REAPER as a zombie process in the Task Manager.
+        // Doing so may cause a deadlock and leaves REAPER as a zombie process in the Task Manager.
         // Cleanup is now safely moved to WM_DESTROY inside UniversalSubclassProc.
 
         // Deleting GDI objects (colors and brushes) is safe here.
@@ -1676,5 +1876,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         if (g_hbrSystemWindows) DeleteObject(g_hbrSystemWindows);
         break;
     }
+
     return TRUE;
 }
