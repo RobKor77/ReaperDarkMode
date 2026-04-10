@@ -99,6 +99,10 @@ bool UAHWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam, LRESULT* 
         // Color menu background
         FillRect(pUDM->hdc, &rc, g_brBarBackground);
 
+        // Fix for the horizontal white line underneath the menu bar
+        RECT rcSeparator = { rc.left, rc.bottom, rc.right, rc.bottom + 1 };
+        FillRect(pUDM->hdc, &rcSeparator, g_brBarBackground);
+
         return true;
     }
     case WM_UAHDRAWMENUITEM: {

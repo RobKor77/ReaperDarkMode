@@ -175,6 +175,29 @@ static void UpdateMainMenuOwnerDraw(HWND hWnd) {
     if (changed) DrawMenuBar(hWnd);
 }
 
+// Helper for the horizontal white line underneath the menu bar
+static void DrawMenuBarSeparator(HWND hWnd) {
+    HDC hdc = GetWindowDC(hWnd);
+    if (hdc) {
+        RECT rcWin;
+        GetWindowRect(hWnd, &rcWin);
+        MENUBARINFO mbi = { sizeof(mbi) };
+        if (GetMenuBarInfo(hWnd, OBJID_MENU, 0, &mbi)) {
+            RECT rcBar = mbi.rcBar;
+            OffsetRect(&rcBar, -rcWin.left, -rcWin.top);
+
+            if (rcBar.bottom > rcBar.top) {
+                // Draw a 1px line at the bottom of the menu bar to cover the white separator
+                RECT rcLine = { rcBar.left, rcBar.bottom, rcBar.right, rcBar.bottom + 1 };
+                HBRUSH hbr = CreateSolidBrush(g_menuBgColor);
+                FillRect(hdc, &rcLine, hbr);
+                DeleteObject(hbr);
+            }
+        }
+        ReleaseDC(hWnd, hdc);
+    }
+}
+
 // Safe window text retrieval with timeout to prevent deadlocks
 static bool SafeGetWindowText(HWND hWnd, wchar_t* buffer, int maxCount) {
     if (!buffer || maxCount <= 0) return false;
@@ -795,7 +818,7 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
     }
 
     // --- CUSTOM THIN BORDER FOR LISTVIEWS AND TREEVIEWS ---
-    if (uMsg == WM_NCPAINT) {
+    if (uMsg == WM_NCPAINT || uMsg == WM_NCACTIVATE) {
         if (classType == WND_LISTVIEW || classType == WND_TREEVIEW) {
             // Let Windows draw the default 3D scrollbars and edges first
             LRESULT res = DefSubclassProc(hWnd, uMsg, wParam, lParam);
@@ -826,6 +849,11 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
             DeleteObject(hPenBg);
             ReleaseDC(hWnd, hdc);
 
+            return res;
+        }
+        else if (GetMenu(hWnd) != NULL) {
+            LRESULT res = DefSubclassProc(hWnd, uMsg, wParam, lParam);
+            DrawMenuBarSeparator(hWnd);
             return res;
         }
     }
