@@ -6,7 +6,7 @@ Description:    Provides a full dark mode implementation for Reaper (Windows pla
 
 Author:         Copyright (c) 2026 Rob Kor (Wormhole Labs)
 Created:        2026
-Version:        Release v1.0.4
+Version:        Release v1.0.5
 
 Platform:       Windows 10, Windows 11
 Compiler:       MSVC / Visual Studio
@@ -91,6 +91,7 @@ static COLORREF g_TreeSelectionTextColor = RGB(255, 255, 255);
 static COLORREF g_TabBackground = RGB(56, 56, 56);
 static COLORREF g_TabSelected = RGB(32, 32, 32);
 static COLORREF g_SystemWindowsColor = RGB(75, 75, 75);
+static COLORREF g_TreeSelectionBgColor = RGB(80, 80, 80);
 
 static HBRUSH g_hbrTabBackground = NULL;
 static HBRUSH g_hbrTabSelected = NULL;
@@ -503,41 +504,99 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
             // --- LEFT SIDE (TreeView - FX) ---
             if (wcscmp(clsName, CLASSNAME_TREEVIEW) == 0) {
                 LPNMTVCUSTOMDRAW ptvcd = (LPNMTVCUSTOMDRAW)lParam;
+
                 if (ptvcd->nmcd.dwDrawStage == CDDS_PREPAINT) {
+                    // Skrijemo pikčaste linije fokusa
+                    SendMessage(nmhdr->hwndFrom, 0x0127 /*WM_CHANGEUISTATE*/, MAKEWPARAM(1, 1), 0);
+
                     LRESULT res = DefSubclassProc(hWnd, uMsg, wParam, lParam);
                     return res | CDRF_NOTIFYITEMDRAW;
                 }
                 else if (ptvcd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
-                    bool isSelected = (ptvcd->nmcd.uItemState & (CDIS_SELECTED | CDIS_FOCUS | CDIS_DROPHILITED)) != 0;
+                    bool isActuallySelected = (SendMessage(nmhdr->hwndFrom, 4391, ptvcd->nmcd.dwItemSpec, 2) & 2) != 0;
 
-                    if (isSelected) {
-                        ptvcd->clrText = g_TreeSelectionTextColor;
+                    if (isActuallySelected) {
+                        
+                        COLORREF normalBg = GetWindowBgColor(nmhdr->hwndFrom);
+                        ptvcd->clrText = normalBg;
+                        ptvcd->clrTextBk = normalBg;
 
-                        // CRITICAL: Don't color background!
+                        ptvcd->nmcd.uItemState &= ~(CDIS_SELECTED | CDIS_FOCUS | CDIS_HOT);
+
+                        return CDRF_NEWFONT | CDRF_NOTIFYPOSTPAINT;
                     }
                     else {
+                        // Normal not-selected element
                         ptvcd->clrText = g_TextColor;
+                        ptvcd->clrTextBk = GetWindowBgColor(nmhdr->hwndFrom);
+                        return CDRF_NEWFONT;
                     }
-                    return CDRF_NEWFONT;
+                }
+                else if (ptvcd->nmcd.dwDrawStage == CDDS_ITEMPOSTPAINT) {
+                    bool isActuallySelected = (SendMessage(nmhdr->hwndFrom, 4391, ptvcd->nmcd.dwItemSpec, 2) & 2) != 0;
+
+                    if (isActuallySelected) {
+                        HDC hdc = ptvcd->nmcd.hdc;
+                        HWND hTree = nmhdr->hwndFrom;
+                        HTREEITEM hItem = (HTREEITEM)ptvcd->nmcd.dwItemSpec;
+
+                        RECT rcText;
+                        *(HTREEITEM*)&rcText = hItem;
+                        if (SendMessage(hTree, 4356, TRUE, (LPARAM)&rcText)) {
+
+                            HBRUSH hBrush = CreateSolidBrush(g_TreeSelectionBgColor);
+                            FillRect(hdc, &rcText, hBrush);
+                            DeleteObject(hBrush);
+
+                            wchar_t text[256] = { 0 };
+                            TVITEMEXW item = { 0 };
+                            item.mask = TVIF_TEXT | TVIF_HANDLE;
+                            item.hItem = hItem;
+                            item.pszText = text;
+                            item.cchTextMax = 256;
+                            SendMessage(hTree, 4414, 0, (LPARAM)&item);
+
+                            SetTextColor(hdc, g_TreeSelectionTextColor);
+                            SetBkMode(hdc, TRANSPARENT);
+
+                            RECT rcDraw = rcText;
+                            rcDraw.left += 2;
+                            DrawText(hdc, text, -1, &rcDraw, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+                        }
+                        return CDRF_DODEFAULT;
+                    }
                 }
             }
-            // --- RIGHT SIDE: General lists (ListView - Actions, FX seznami) ---
+            // --- RIGHT SIDE: General lists (ListView - Actions, FX lists) ---
             else if (wcscmp(clsName, CLASSNAME_LISTVIEW) == 0) {
                 LPNMLVCUSTOMDRAW plvcd = (LPNMLVCUSTOMDRAW)lParam;
 
                 if (plvcd->nmcd.dwDrawStage == CDDS_PREPAINT) {
+
+                    SendMessage(nmhdr->hwndFrom, 0x0127 /*WM_CHANGEUISTATE*/, MAKEWPARAM(1, 1), 0);
+
                     LRESULT res = DefSubclassProc(hWnd, uMsg, wParam, lParam);
                     return res | CDRF_NOTIFYITEMDRAW;
                 }
                 else if (plvcd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
-                    bool isSelected = (plvcd->nmcd.uItemState & (CDIS_SELECTED | CDIS_FOCUS | CDIS_DROPHILITED)) != 0;
+
+                    bool isSelected = (SendMessage(nmhdr->hwndFrom, 4140, plvcd->nmcd.dwItemSpec, 2) & 2) != 0;
 
                     if (isSelected) {
-                        // Let the OS draw the default selection highlight and text color.
-                        return CDRF_DODEFAULT;
+                        HDC hdc = plvcd->nmcd.hdc;
+                        RECT rc = plvcd->nmcd.rc;
+                        HBRUSH hBrush = CreateSolidBrush(g_TreeSelectionBgColor);
+                        FillRect(hdc, &rc, hBrush);
+                        DeleteObject(hBrush);
+
+                        plvcd->clrText = g_TreeSelectionTextColor;
+                        plvcd->clrTextBk = g_TreeSelectionBgColor;
+
+                        plvcd->nmcd.uItemState &= ~(CDIS_SELECTED | CDIS_FOCUS | CDIS_HOT);
+
+                        return CDRF_NEWFONT;
                     }
                     else {
-                        // Apply custom text color and background for unselected items.
                         COLORREF bgColor = GetWindowBgColor(nmhdr->hwndFrom);
                         plvcd->clrTextBk = bgColor;
                         plvcd->clrText = g_TextColor;
@@ -1655,6 +1714,7 @@ static void LoadConfig() {
     g_HeaderBackground = ReadColorFromIni(g_IniPath.c_str(), L"HeaderBackground", g_HeaderBackground);
     g_HeaderTextColor = ReadColorFromIni(g_IniPath.c_str(), L"HeaderTextColor", g_HeaderTextColor);
     g_TreeSelectionTextColor = ReadColorFromIni(g_IniPath.c_str(), L"TreeSelectionTextColor", g_TreeSelectionTextColor);
+    g_TreeSelectionBgColor = ReadColorFromIni(g_IniPath.c_str(), L"TreeSelectionBgColor", g_TreeSelectionBgColor);
     g_TabBackground = ReadColorFromIni(g_IniPath.c_str(), L"TabBackground", g_TabBackground);
     g_TabSelected = ReadColorFromIni(g_IniPath.c_str(), L"TabSelected", g_TabSelected);
 
