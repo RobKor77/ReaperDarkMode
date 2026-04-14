@@ -1884,6 +1884,10 @@ extern "C" __declspec(dllexport) int ReaperPluginEntry(void* r, void* v) {
             SetThemeColor("midieditorlist_grid", (int)gridColor, 0);
             SetThemeColor("explorer_grid", (int)gridColor, 0);
 
+            // 3. Sync Text Color (TUKAJ JE DODATEK!)
+            COLORREF textColor = ReadColorFromIni(g_IniPath.c_str(), L"ThemedWindowText", RGB(160, 160, 160));
+            SetThemeColor("col_main_text", (int)textColor, 0);
+
             ThemeLayout_RefreshAll();
         }
         // ----------------------------------------------
