@@ -6,7 +6,7 @@ Description:    Provides a full dark mode implementation for Reaper (Windows pla
 
 Author:         Copyright (c) 2026 Rob Kor (Wormhole Labs)
 Created:        2026
-Version:        Release v1.0.5
+Version:        Release v1.0.6
 
 Platform:       Windows 10, Windows 11
 Compiler:       MSVC / Visual Studio
@@ -69,6 +69,7 @@ static const wchar_t CLASSNAME_MENU[] = L"#32768";
 static const wchar_t CLASSNAME_COMBOBOXEX[] = L"ComboBoxEx32";
 static const wchar_t CLASSNAME_REAPER_PREFIX[] = L"REAPER";
 static const wchar_t CLASSNAME_DUI_VIEW[] = L"DUIViewWndClassName";
+static bool g_bGlobalPinEnabled = true;
 // ================================================
 
 #ifndef DWMWA_BORDER_COLOR
@@ -494,6 +495,36 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
         EnsureBrushesAreAlive();
     }
 
+    // --- AVTOMATIC PINNING OF NON-MIXER WINDOWS (CONFIG IN INI) ---
+    if (uMsg == WM_SHOWWINDOW || uMsg == WM_ACTIVATE || uMsg == WM_ACTIVATEAPP) {
+        HWND rootTemp = GetAncestor(hWnd, GA_ROOT);
+
+        if (rootTemp && hWnd == rootTemp && rootTemp != g_ReaperMainWindow) {
+
+            wchar_t rootTitle[256] = { 0 };
+            SafeGetWindowText(rootTemp, rootTitle, 256);
+
+            if (wcslen(rootTitle) > 0 && wcsstr(rootTitle, L"Mixer") == NULL) {
+
+                if (g_bGlobalPinEnabled) {
+
+                    if (uMsg == WM_SHOWWINDOW ||
+                        (uMsg == WM_ACTIVATEAPP && wParam == TRUE) ||
+                        (uMsg == WM_ACTIVATE && LOWORD(wParam) != WA_INACTIVE)) {
+
+                        SetWindowPos(rootTemp, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    }
+
+                    else if (uMsg == WM_ACTIVATEAPP && wParam == FALSE) {
+
+                        SetWindowPos(rootTemp, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    }
+                }
+            }
+        }
+    }
+    // ----------------------------------------------------------------
+
     /// --- CUSTOM DRAW for TREEVIEW and LISTVIEW ---
     if (uMsg == WM_NOTIFY) {
         LPNMHDR nmhdr = (LPNMHDR)lParam;
@@ -501,12 +532,15 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
             wchar_t clsName[256] = { 0 };
             GetClassNameW(nmhdr->hwndFrom, clsName, 256);
 
+            // FOCUS DETECTION: Check if the specific list currently has keyboard/mouse focus
+            bool hasFocus = (GetFocus() == nmhdr->hwndFrom);
+
             // --- LEFT SIDE (TreeView - FX) ---
             if (wcscmp(clsName, CLASSNAME_TREEVIEW) == 0) {
                 LPNMTVCUSTOMDRAW ptvcd = (LPNMTVCUSTOMDRAW)lParam;
 
                 if (ptvcd->nmcd.dwDrawStage == CDDS_PREPAINT) {
-                    // Skrijemo pikčaste linije fokusa
+                    // Hide native dotted focus lines
                     SendMessage(nmhdr->hwndFrom, 0x0127 /*WM_CHANGEUISTATE*/, MAKEWPARAM(1, 1), 0);
 
                     LRESULT res = DefSubclassProc(hWnd, uMsg, wParam, lParam);
@@ -516,7 +550,6 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                     bool isActuallySelected = (SendMessage(nmhdr->hwndFrom, 4391, ptvcd->nmcd.dwItemSpec, 2) & 2) != 0;
 
                     if (isActuallySelected) {
-                        
                         COLORREF normalBg = GetWindowBgColor(nmhdr->hwndFrom);
                         ptvcd->clrText = normalBg;
                         ptvcd->clrTextBk = normalBg;
@@ -544,7 +577,9 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                         *(HTREEITEM*)&rcText = hItem;
                         if (SendMessage(hTree, 4356, TRUE, (LPARAM)&rcText)) {
 
-                            HBRUSH hBrush = CreateSolidBrush(g_TreeSelectionBgColor);
+                            // BACKGROUND SELECTION: Draw highlight color ONLY if list has focus
+                            COLORREF bgColor = hasFocus ? g_TreeSelectionBgColor : GetWindowBgColor(hTree);
+                            HBRUSH hBrush = CreateSolidBrush(bgColor);
                             FillRect(hdc, &rcText, hBrush);
                             DeleteObject(hBrush);
 
@@ -556,6 +591,7 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                             item.cchTextMax = 256;
                             SendMessage(hTree, 4414, 0, (LPARAM)&item);
 
+                            // Keep text color highlighted even without background box
                             SetTextColor(hdc, g_TreeSelectionTextColor);
                             SetBkMode(hdc, TRANSPARENT);
 
@@ -572,25 +608,27 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                 LPNMLVCUSTOMDRAW plvcd = (LPNMLVCUSTOMDRAW)lParam;
 
                 if (plvcd->nmcd.dwDrawStage == CDDS_PREPAINT) {
-
                     SendMessage(nmhdr->hwndFrom, 0x0127 /*WM_CHANGEUISTATE*/, MAKEWPARAM(1, 1), 0);
 
                     LRESULT res = DefSubclassProc(hWnd, uMsg, wParam, lParam);
                     return res | CDRF_NOTIFYITEMDRAW;
                 }
                 else if (plvcd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
-
                     bool isSelected = (SendMessage(nmhdr->hwndFrom, 4140, plvcd->nmcd.dwItemSpec, 2) & 2) != 0;
 
                     if (isSelected) {
                         HDC hdc = plvcd->nmcd.hdc;
                         RECT rc = plvcd->nmcd.rc;
-                        HBRUSH hBrush = CreateSolidBrush(g_TreeSelectionBgColor);
+
+                        // BACKGROUND SELECTION: Draw highlight color ONLY if list has focus
+                        COLORREF bgColor = hasFocus ? g_TreeSelectionBgColor : GetWindowBgColor(nmhdr->hwndFrom);
+                        HBRUSH hBrush = CreateSolidBrush(bgColor);
                         FillRect(hdc, &rc, hBrush);
                         DeleteObject(hBrush);
 
+                        // Keep text color highlighted even without background box
                         plvcd->clrText = g_TreeSelectionTextColor;
-                        plvcd->clrTextBk = g_TreeSelectionBgColor;
+                        plvcd->clrTextBk = bgColor;
 
                         plvcd->nmcd.uItemState &= ~(CDIS_SELECTED | CDIS_FOCUS | CDIS_HOT);
 
@@ -611,6 +649,17 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
     GetClassName(hWnd, className, 256);
 
     WndClass classType = (WndClass)dwRefData;
+
+    // --- IMMEDIATE LIST REFRESH ON FOCUS CHANGE ---
+    // Forces TreeViews and ListViews to redraw immediately when they gain or lose focus,
+    // ensuring our custom unfocused selection color updates instantly.
+    if (uMsg == WM_SETFOCUS || uMsg == WM_KILLFOCUS) {
+        if (classType == WND_TREEVIEW || classType == WND_LISTVIEW) {
+            InvalidateRect(hWnd, NULL, FALSE);
+            UpdateWindow(hWnd);
+        }
+    }
+    // ----------------------------------------------------------
 
     // --- SAFE SHUTDOWN CLEANUP ---
     if (uMsg == WM_DESTROY && hWnd == g_ReaperMainWindow) {
@@ -1742,6 +1791,9 @@ static void LoadConfig() {
     int enabledInt = GetPrivateProfileIntW(L"Settings", L"Enabled", 1, g_IniPath.c_str());
     g_bIsEnabled = (enabledInt != 0);
 
+    // Read global pin status
+    int globalPinInt = GetPrivateProfileIntW(L"Settings", L"GlobalPin", 0, g_IniPath.c_str());
+    g_bGlobalPinEnabled = (globalPinInt != 0);
     // Save the current file time
     g_LastIniTime = GetFileWriteTime(g_IniPath);
 }
