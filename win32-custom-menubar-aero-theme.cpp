@@ -942,32 +942,42 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
     if (uMsg == WM_PAINT) {
         HWND rootTemp = GetAncestor(hWnd, GA_ROOT);
 
-        // HYBRID DARK/LIGHT WINDOW "CONFIRM SAVE AS" --- 
-        // We detect the window by title and strip the dark theme from the content
-        // while re-applying the dark title bar for a consistent UI look.
-        wchar_t wndTitle[256] = { 0 };
-        SafeGetWindowText(hWnd, wndTitle, 256);
+        // --- OPTIMIZATION: Check for "Confirm Save As" ONLY on dialogs and ONLY ONCE ---
+        // Calling SafeGetWindowText on every WM_PAINT tick causes severe UI lag (e.g., tracklist scrolling).
+        if (classType == WND_DIALOG) {
+            // Check if we have already tested this specific window to avoid redundant polling
+            if (GetPropW(hWnd, L"HybridChecked") == NULL) {
+                SetPropW(hWnd, L"HybridChecked", (HANDLE)1); // Mark as checked
 
-        if (wcscmp(wndTitle, L"Confirm Save As") == 0) {
-            if (GetPropW(hWnd, L"HybridStyled") == NULL) {
-                SetPropW(hWnd, L"HybridStyled", (HANDLE)1);
+                wchar_t wndTitle[256] = { 0 };
+                SafeGetWindowText(hWnd, wndTitle, 256);
 
-                // 1. Remove the custom Dark Mode theme from the window content
-                SetWindowTheme(hWnd, NULL, NULL);
+                if (wcscmp(wndTitle, L"Confirm Save As") == 0) {
+                    if (GetPropW(hWnd, L"HybridStyled") == NULL) {
+                        SetPropW(hWnd, L"HybridStyled", (HANDLE)1);
 
-                // 2. Remove our subclassing from child buttons to make them light again
-                EnumChildWindows(hWnd, [](HWND hChild, LPARAM lp) -> BOOL {
-                    RemoveWindowSubclass(hChild, UniversalSubclassProc, 1);
-                    RemoveWindowSubclass(hChild, UniversalSubclassProc, 3);
-                    SetWindowTheme(hChild, NULL, NULL);
-                    return TRUE;
-                    }, 0);
+                        // 1. Remove the custom Dark Mode theme from the window content
+                        SetWindowTheme(hWnd, NULL, NULL);
 
-                // 3. Re-force the dark title bar via DWM (crucial after theme reset)
-                DarkenTitleBar(hWnd);
+                        // 2. Remove our subclassing from child buttons to make them light again
+                        EnumChildWindows(hWnd, [](HWND hChild, LPARAM lp) -> BOOL {
+                            RemoveWindowSubclass(hChild, UniversalSubclassProc, 1);
+                            RemoveWindowSubclass(hChild, UniversalSubclassProc, 3);
+                            SetWindowTheme(hChild, NULL, NULL);
+                            return TRUE;
+                            }, 0);
 
-                // Refresh to apply changes immediately
-                InvalidateRect(hWnd, NULL, TRUE);
+                        // 3. Re-force the dark title bar via DWM (crucial after theme reset)
+                        DarkenTitleBar(hWnd);
+
+                        // Refresh to apply changes immediately
+                        InvalidateRect(hWnd, NULL, TRUE);
+                    }
+                }
+            }
+
+            // If the window is flagged as Hybrid, return native drawing immediately
+            if (GetPropW(hWnd, L"HybridStyled") != NULL) {
                 return DefSubclassProc(hWnd, uMsg, wParam, lParam);
             }
         }
@@ -1936,7 +1946,7 @@ extern "C" __declspec(dllexport) int ReaperPluginEntry(void* r, void* v) {
             SetThemeColor("midieditorlist_grid", (int)gridColor, 0);
             SetThemeColor("explorer_grid", (int)gridColor, 0);
 
-            // 3. Sync Text Color (TUKAJ JE DODATEK!)
+            // 3. Sync Text Color
             COLORREF textColor = ReadColorFromIni(g_IniPath.c_str(), L"ThemedWindowText", RGB(160, 160, 160));
             SetThemeColor("col_main_text", (int)textColor, 0);
 
