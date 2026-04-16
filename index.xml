@@ -18,7 +18,7 @@
 
     <reapack name="Reaper Dark Mode Settings" type="script" desc="Lua script for configuring Dark Mode colors">
       <version name="1.0.6" author="Rob Kor">
-        <source main="main" file="DarkMode.Config.lua">https://github.com/RobKor77/ReaperDarkMode/releases/download/v1.0.6/DarkMode.Config.lua</source>
+        <source main="main" file="DarkModeConfig.lua">https://github.com/RobKor77/ReaperDarkMode/releases/download/v1.0.6/DarkModeConfig.lua</source>
       </version>
       
       <version name="1.0.5" author="Rob Kor">
