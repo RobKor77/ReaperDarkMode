@@ -6,7 +6,7 @@ Description:    Provides a full dark mode implementation for Reaper (Windows pla
 
 Author:         Copyright (c) 2026 Rob Kor (Wormhole Labs)
 Created:        2026
-Version:        Release v1.0.6
+Version:        Release v1.0.7
 
 Platform:       Windows 10, Windows 11
 Compiler:       MSVC / Visual Studio
@@ -92,7 +92,8 @@ static COLORREF g_TreeSelectionTextColor = RGB(255, 255, 255);
 static COLORREF g_TabBackground = RGB(56, 56, 56);
 static COLORREF g_TabSelected = RGB(32, 32, 32);
 static COLORREF g_SystemWindowsColor = RGB(75, 75, 75);
-static COLORREF g_TreeSelectionBgColor = RGB(80, 80, 80);
+static COLORREF g_TreeSelectionBgColor = RGB(90, 90, 90);
+static COLORREF g_TreeUnfocusedSelectionBgColor = RGB(60, 60, 60);
 
 static HBRUSH g_hbrTabBackground = NULL;
 static HBRUSH g_hbrTabSelected = NULL;
@@ -139,12 +140,13 @@ static void UpdateMainMenuOwnerDraw(HWND hWnd) {
 
     for (int i = 0; i < count; i++) {
         MENUITEMINFOW mii = { sizeof(MENUITEMINFOW) };
-        mii.fMask = MIIM_FTYPE;
+        mii.fMask = MIIM_FTYPE | MIIM_DATA;
         GetMenuItemInfoW(hMenu, i, TRUE, &mii);
 
         if (isFullscreen) {
-            if (!(mii.fType & MFT_OWNERDRAW)) {
+            if (!(mii.fType & MFT_OWNERDRAW) || mii.dwItemData != (ULONG_PTR)(0xDEAD0000 | i)) {
                 mii.fType |= MFT_OWNERDRAW;
+                mii.dwItemData = (ULONG_PTR)(0xDEAD0000 | i);
                 SetMenuItemInfoW(hMenu, i, TRUE, &mii);
                 changed = true;
             }
@@ -152,6 +154,13 @@ static void UpdateMainMenuOwnerDraw(HWND hWnd) {
         else {
             if (mii.fType & MFT_OWNERDRAW) {
                 mii.fType &= ~MFT_OWNERDRAW;
+                mii.dwItemData = 0;
+
+                wchar_t text[256] = { 0 };
+                GetMenuStringW(hMenu, i, text, 256, MF_BYPOSITION);
+                mii.fMask |= MIIM_STRING;
+                mii.dwTypeData = text;
+
                 SetMenuItemInfoW(hMenu, i, TRUE, &mii);
                 changed = true;
             }
@@ -436,6 +445,29 @@ static void EnsureBrushesAreAlive() {
     }
 }
 
+// Helper for the horizontal white line underneath the menu bar
+static void DrawMenuBarSeparator(HWND hWnd) {
+    HDC hdc = GetWindowDC(hWnd);
+    if (hdc) {
+        RECT rcWin;
+        GetWindowRect(hWnd, &rcWin);
+        MENUBARINFO mbi = { sizeof(mbi) };
+        if (GetMenuBarInfo(hWnd, OBJID_MENU, 0, &mbi)) {
+            RECT rcBar = mbi.rcBar;
+            OffsetRect(&rcBar, -rcWin.left, -rcWin.top);
+
+            if (rcBar.bottom > rcBar.top) {
+                // Draw a 1px line at the bottom of the menu bar to cover the white separator
+                RECT rcLine = { rcBar.left, rcBar.bottom, rcBar.right, rcBar.bottom + 1 };
+                HBRUSH hbr = CreateSolidBrush(g_menuBgColor);
+                FillRect(hdc, &rcLine, hbr);
+                DeleteObject(hbr);
+            }
+        }
+        ReleaseDC(hWnd, hdc);
+    }
+}
+
 // -----------------------------------------------------------------------------
 // CUSTOM PAINT SUBCLASS FOR FAKE SYSLINKS (Reaper Link Buttons)
 // -----------------------------------------------------------------------------
@@ -496,7 +528,7 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
     }
 
     // --- AVTOMATIC PINNING OF NON-MIXER WINDOWS (CONFIG IN INI) ---
-    if (uMsg == WM_SHOWWINDOW || uMsg == WM_ACTIVATE || uMsg == WM_ACTIVATEAPP) {
+    if (uMsg == WM_ACTIVATE || uMsg == WM_ACTIVATEAPP) {
         HWND rootTemp = GetAncestor(hWnd, GA_ROOT);
 
         if (rootTemp && hWnd == rootTemp && rootTemp != g_ReaperMainWindow) {
@@ -508,16 +540,21 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
 
                 if (g_bGlobalPinEnabled) {
 
-                    if (uMsg == WM_SHOWWINDOW ||
-                        (uMsg == WM_ACTIVATEAPP && wParam == TRUE) ||
-                        (uMsg == WM_ACTIVATE && LOWORD(wParam) != WA_INACTIVE)) {
+                    // Čarobni flagi: Ne riši na novo in ne pošiljaj sporočil o spremembi velikosti!
+                    UINT uFlags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOSENDCHANGING;
 
-                        SetWindowPos(rootTemp, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    if (uMsg == WM_ACTIVATEAPP) {
+                        if (wParam == TRUE) {
+                            SetWindowPos(rootTemp, HWND_TOPMOST, 0, 0, 0, 0, uFlags);
+                        }
+                        else {
+                            SetWindowPos(rootTemp, HWND_NOTOPMOST, 0, 0, 0, 0, uFlags);
+                        }
                     }
-
-                    else if (uMsg == WM_ACTIVATEAPP && wParam == FALSE) {
-
-                        SetWindowPos(rootTemp, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    else if (uMsg == WM_ACTIVATE) {
+                        if (LOWORD(wParam) != WA_INACTIVE) {
+                            SetWindowPos(rootTemp, HWND_TOPMOST, 0, 0, 0, 0, uFlags);
+                        }
                     }
                 }
             }
@@ -577,8 +614,8 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                         *(HTREEITEM*)&rcText = hItem;
                         if (SendMessage(hTree, 4356, TRUE, (LPARAM)&rcText)) {
 
-                            // BACKGROUND SELECTION: Draw highlight color ONLY if list has focus
-                            COLORREF bgColor = hasFocus ? g_TreeSelectionBgColor : GetWindowBgColor(hTree);
+                            // BACKGROUND SELECTION: Draw focused or unfocused selection color
+                            COLORREF bgColor = hasFocus ? g_TreeSelectionBgColor : g_TreeUnfocusedSelectionBgColor;
                             HBRUSH hBrush = CreateSolidBrush(bgColor);
                             FillRect(hdc, &rcText, hBrush);
                             DeleteObject(hBrush);
@@ -620,8 +657,8 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                         HDC hdc = plvcd->nmcd.hdc;
                         RECT rc = plvcd->nmcd.rc;
 
-                        // BACKGROUND SELECTION: Draw highlight color ONLY if list has focus
-                        COLORREF bgColor = hasFocus ? g_TreeSelectionBgColor : GetWindowBgColor(nmhdr->hwndFrom);
+                        // BACKGROUND SELECTION: Draw focused or unfocused selection color
+                        COLORREF bgColor = hasFocus ? g_TreeSelectionBgColor : g_TreeUnfocusedSelectionBgColor;
                         HBRUSH hBrush = CreateSolidBrush(bgColor);
                         FillRect(hdc, &rc, hBrush);
                         DeleteObject(hBrush);
@@ -708,22 +745,42 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
         MEASUREITEMSTRUCT* mis = (MEASUREITEMSTRUCT*)lParam;
         if (mis->CtlType == ODT_MENU) {
             wchar_t text[256] = { 0 };
-            if (GetMenuTextFromItemStruct(hWnd, mis->itemID, text, 256)) {
+            bool foundText = false;
+
+            if ((mis->itemData & 0xFFFF0000) == 0xDEAD0000) {
+                int pos = mis->itemData & 0xFFFF;
+                HMENU hMenu = GetMenu(hWnd);
+                GetMenuStringW(hMenu, pos, text, 256, MF_BYPOSITION);
+                foundText = true;
+            }
+            else {
+                foundText = GetMenuTextFromItemStruct(hWnd, mis->itemID, text, 256);
+            }
+
+            if (foundText) {
                 HDC hdc = GetDC(hWnd);
                 NONCLIENTMETRICSW ncm = { sizeof(NONCLIENTMETRICSW) };
                 SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(NONCLIENTMETRICSW), &ncm, 0);
+
                 HFONT hSysFont = CreateFontIndirectW(&ncm.lfMenuFont);
                 HFONT hOldFont = (HFONT)SelectObject(hdc, hSysFont);
 
-                SIZE size;
+                SIZE size = { 0 };
                 GetTextExtentPoint32W(hdc, text, (int)wcslen(text), &size);
 
                 SelectObject(hdc, hOldFont);
                 DeleteObject(hSysFont);
                 ReleaseDC(hWnd, hdc);
 
-                mis->itemWidth = size.cx + 5; // padding modification
-                mis->itemHeight = size.cy + 6;
+                UINT dpi = GetDpiForWindow(hWnd);
+                if (dpi == 0) dpi = 96;
+                float dpiScale = (float)dpi / 96.0f;
+
+
+                mis->itemWidth = size.cx + (int)(5.0f * dpiScale);
+                mis->itemHeight = size.cy + (int)(6.0f * dpiScale);
+                // ----------------------------
+
                 return TRUE;
             }
         }
@@ -734,7 +791,17 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
         DRAWITEMSTRUCT* dis = (DRAWITEMSTRUCT*)lParam;
         if (dis->CtlType == ODT_MENU) {
             wchar_t text[256] = { 0 };
-            if (GetMenuTextFromItemStruct(hWnd, dis->itemID, text, 256)) {
+            HMENU hMenu = GetMenu(hWnd);
+
+            int count = GetMenuItemCount(hMenu);
+            if (dis->itemData >= 0 && dis->itemData < (ULONG_PTR)count) {
+                GetMenuStringW(hMenu, (UINT)dis->itemData, text, 256, MF_BYPOSITION);
+            }
+            else {
+                GetMenuTextFromItemStruct(hWnd, dis->itemID, text, 256); // Fallback
+            }
+
+            if (wcslen(text) > 0) {
                 bool isSelected = (dis->itemState & ODS_SELECTED) || (dis->itemState & ODS_HOTLIGHT);
 
                 COLORREF bgColor = isSelected ? g_menuHoverColor : g_menuBgColor;
@@ -749,6 +816,7 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
 
                 NONCLIENTMETRICSW ncm = { sizeof(NONCLIENTMETRICSW) };
                 SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(NONCLIENTMETRICSW), &ncm, 0);
+
                 HFONT hSysFont = CreateFontIndirectW(&ncm.lfMenuFont);
                 HFONT hOldFont = (HFONT)SelectObject(dis->hDC, hSysFont);
 
@@ -902,8 +970,8 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
         }
     }
 
-    // --- CUSTOM THIN BORDER FOR LISTVIEWS AND TREEVIEWS ---
-    if (uMsg == WM_NCPAINT) {
+    // --- CUSTOM BORDERS AND MENU SEPARATOR ---
+    if (uMsg == WM_NCPAINT || uMsg == WM_NCACTIVATE) {
         if (classType == WND_LISTVIEW || classType == WND_TREEVIEW) {
             // Let Windows draw the default 3D scrollbars and edges first
             LRESULT res = DefSubclassProc(hWnd, uMsg, wParam, lParam);
@@ -934,6 +1002,12 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
             DeleteObject(hPenBg);
             ReleaseDC(hWnd, hdc);
 
+            return res;
+        }
+        else if (GetMenu(hWnd) != NULL) {
+            // --- FIX: Cover the white separator line under the main menu ---
+            LRESULT res = DefSubclassProc(hWnd, uMsg, wParam, lParam);
+            DrawMenuBarSeparator(hWnd);
             return res;
         }
     }
@@ -981,7 +1055,7 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                 return DefSubclassProc(hWnd, uMsg, wParam, lParam);
             }
         }
-        // ------------------------------------------------
+        // ------------------------------------------------------------------------------------
 
         // PROTECTION: If we are in the Color Picker, the OS MUST draw the squares!
         // Ignore all elements except lists.
@@ -1144,30 +1218,30 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                 GetWindowTextW(hWnd, text, 256);
 
                 if ((int)wcslen(text) > 0) {
-                    // 1. Let the OS draw the native control (glyph + native text)
+                    // Let the OS draw the native control (glyph + native text)
                     LRESULT result = DefSubclassProc(hWnd, uMsg, wParam, lParam);
 
                     HDC hdc = GetDC(hWnd);
                     RECT rc; GetClientRect(hWnd, &rc);
 
-                    // 2. Calculate accurate DPI scale factor
+                    // Calculate accurate DPI scale factor
                     int dpiX = GetDeviceCaps(hdc, LOGPIXELSX);
                     if (dpiX == 0) dpiX = 96; // Fallback to 100%
                     float scale = (float)dpiX / 96.0f;
 
-                    // 3. THE SWEET SPOT (Pixel-perfect cut)
+                    // THE SWEET SPOT (Pixel-perfect cut)
                     // At 100%, the box ends ~14px, native text starts ~16px.
                     // We slice exactly at 15px and scale it perfectly.
                     int clearOffset = (int)(15.0f * scale);
                     int textOffset = (int)(19.0f * scale);
 
-                    // 4. Erase the native text exactly between the box and the text
+                    // Erase the native text exactly between the box and the text
                     RECT rcClear = rc;
                     rcClear.left += clearOffset;
                     HBRUSH bg = GetWindowBgBrush(hWnd);
                     FillRect(hdc, &rcClear, bg);
 
-                    // 5. Draw the custom text
+                    // Draw the custom text
                     HFONT hFont = (HFONT)SendMessageW(hWnd, WM_GETFONT, 0, 0);
                     HFONT hOldFont = (HFONT)SelectObject(hdc, hFont);
 
@@ -1263,10 +1337,10 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
             return 0;
         }
         else if (classType == WND_CLICKPATTERN) {
-            // 1. Let REAPER draw its original white grid and black dots first
+            // Let REAPER draw its original white grid and black dots first
             LRESULT res = DefSubclassProc(hWnd, uMsg, wParam, lParam);
 
-            // 2. Grab the drawn canvas and invert its colors instantly
+            // Grab the drawn canvas and invert its colors instantly
             HDC hdc = GetDC(hWnd);
             RECT rc = { 0 };
             GetClientRect(hWnd, &rc);
@@ -1774,6 +1848,7 @@ static void LoadConfig() {
     g_HeaderTextColor = ReadColorFromIni(g_IniPath.c_str(), L"HeaderTextColor", g_HeaderTextColor);
     g_TreeSelectionTextColor = ReadColorFromIni(g_IniPath.c_str(), L"TreeSelectionTextColor", g_TreeSelectionTextColor);
     g_TreeSelectionBgColor = ReadColorFromIni(g_IniPath.c_str(), L"TreeSelectionBgColor", g_TreeSelectionBgColor);
+    g_TreeUnfocusedSelectionBgColor = ReadColorFromIni(g_IniPath.c_str(), L"TreeUnfocusedSelectionBgColor", g_TreeUnfocusedSelectionBgColor);
     g_TabBackground = ReadColorFromIni(g_IniPath.c_str(), L"TabBackground", g_TabBackground);
     g_TabSelected = ReadColorFromIni(g_IniPath.c_str(), L"TabSelected", g_TabSelected);
 
@@ -1935,18 +2010,18 @@ extern "C" __declspec(dllexport) int ReaperPluginEntry(void* r, void* v) {
         if (g_bIsEnabled && syncInt == 1 && SetThemeColor && ThemeLayout_RefreshAll) {
 
             // Note: COLORREF on Windows perfectly matches REAPER's native color integer
-            // 1. Sync Backgrounds (ColorChild)
+            // Sync Backgrounds (ColorChild)
             SetThemeColor("col_main_bg", (int)g_colorChild, 0);
             SetThemeColor("window_bg", (int)g_colorChild, 0);
             SetThemeColor("col_main_editbk", (int)g_colorChild, 0);
 
-            // 2. Sync Gridlines
+            // Sync Gridlines
             COLORREF gridColor = ReadColorFromIni(g_IniPath.c_str(), L"GridLinesColor", RGB(60, 60, 60));
             SetThemeColor("genlist_grid", (int)gridColor, 0);
             SetThemeColor("midieditorlist_grid", (int)gridColor, 0);
             SetThemeColor("explorer_grid", (int)gridColor, 0);
 
-            // 3. Sync Text Color
+            // Sync Text Color
             COLORREF textColor = ReadColorFromIni(g_IniPath.c_str(), L"ThemedWindowText", RGB(160, 160, 160));
             SetThemeColor("col_main_text", (int)textColor, 0);
 
