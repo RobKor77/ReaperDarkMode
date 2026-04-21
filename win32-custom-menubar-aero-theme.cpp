@@ -528,7 +528,7 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
     }
 
     // --- AVTOMATIC PINNING OF NON-MIXER WINDOWS (CONFIG IN INI) ---
-    if (uMsg == WM_ACTIVATE || uMsg == WM_ACTIVATEAPP) {
+    if (uMsg == WM_SHOWWINDOW || uMsg == WM_ACTIVATE || uMsg == WM_ACTIVATEAPP) {
         HWND rootTemp = GetAncestor(hWnd, GA_ROOT);
 
         if (rootTemp && hWnd == rootTemp && rootTemp != g_ReaperMainWindow) {
@@ -540,22 +540,28 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
 
                 if (g_bGlobalPinEnabled) {
 
-                    // Čarobni flagi: Ne riši na novo in ne pošiljaj sporočil o spremembi velikosti!
-                    UINT uFlags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOSENDCHANGING;
+                    // Standardni flagi (Brez NOREDRAW, da se okno lahko normalno osveži)
+                    UINT uFlags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
 
-                    if (uMsg == WM_ACTIVATEAPP) {
+                    // 1. Ko se okno PRIKAŽE -> Pripni na vrh
+                    if (uMsg == WM_SHOWWINDOW && wParam == TRUE) {
+                        SetWindowPos(rootTemp, HWND_TOPMOST, 0, 0, 0, 0, uFlags);
+                    }
+                    // 2. Ko okno DOBI FOKUS -> Pripni na vrh
+                    else if (uMsg == WM_ACTIVATE && LOWORD(wParam) != WA_INACTIVE) {
+                        SetWindowPos(rootTemp, HWND_TOPMOST, 0, 0, 0, 0, uFlags);
+                    }
+                    // 3. Ko preklapljamo med Reaperjem in drugimi programi (npr. Chrome)
+                    else if (uMsg == WM_ACTIVATEAPP) {
                         if (wParam == TRUE) {
-                            SetWindowPos(rootTemp, HWND_TOPMOST, 0, 0, 0, 0, uFlags);
+                            SetWindowPos(rootTemp, HWND_TOPMOST, 0, 0, 0, 0, uFlags); // Nazaj v Reaperju
                         }
                         else {
-                            SetWindowPos(rootTemp, HWND_NOTOPMOST, 0, 0, 0, 0, uFlags);
+                            SetWindowPos(rootTemp, HWND_NOTOPMOST, 0, 0, 0, 0, uFlags); // Alt+Tab ven iz Reaperja
                         }
                     }
-                    else if (uMsg == WM_ACTIVATE) {
-                        if (LOWORD(wParam) != WA_INACTIVE) {
-                            SetWindowPos(rootTemp, HWND_TOPMOST, 0, 0, 0, 0, uFlags);
-                        }
-                    }
+                    // OPOMBA: WM_SHOWWINDOW z wParam == FALSE namenoma IGNORIRAMO. 
+                    // Reaper ga bo skril sam in s tem preprečimo "Ghost Pin" hrošča!
                 }
             }
         }
@@ -1467,6 +1473,12 @@ static void StyleWindow(HWND hwnd) {
 
     // --- IGNORE MENUS ---
     if (wcscmp(className, CLASSNAME_MENU) == 0) return;
+
+    // --- IGNORE PYTHON TCL/TK WINDOWS (CRASH FIX) ---
+    // Tcl/Tkinter uses its own custom rendering engine. Subclassing these will crash the tcl86t.dll module.
+    if (wcsncmp(className, L"TkTopLevel", 10) == 0 || wcsncmp(className, L"TkChild", 7) == 0) {
+        return;
+    }
 
     // --- PROTECT FLOATING OVERLAYS (MIDI Razor Edit) ---
     LONG wndStyle = GetWindowLong(hwnd, GWL_STYLE);
