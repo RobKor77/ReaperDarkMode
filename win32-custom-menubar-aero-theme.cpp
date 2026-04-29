@@ -6,7 +6,7 @@ Description:    Provides a full dark mode implementation for Reaper (Windows pla
 
 Author:         Copyright (c) 2026 Rob Kor (Wormhole Labs)
 Created:        2026
-Version:        Release v1.0.7
+Version:        Release v1.0.8
 
 Platform:       Windows 10, Windows 11
 Compiler:       MSVC / Visual Studio
@@ -515,6 +515,18 @@ static LRESULT CALLBACK FakeSysLinkSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPa
     return DefSubclassProc(hWnd, uMsg, wParam, lParam);
 }
 
+// Safe DPI helper for compatibility with Windows 7/8/10
+static UINT GetSafeDPI(HWND hWnd) {
+    HDC hdc = GetDC(hWnd);
+    int dpi = 96; // Default fallback
+    if (hdc) {
+        dpi = GetDeviceCaps(hdc, LOGPIXELSX);
+        ReleaseDC(hWnd, hdc);
+    }
+    return (dpi == 0) ? 96 : dpi;
+}
+
+
 static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
     LRESULT lr = 0;
     if (UAHWndProc(hWnd, uMsg, wParam, lParam, &lr)) return lr;
@@ -540,28 +552,25 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
 
                 if (g_bGlobalPinEnabled) {
 
-                    // Standardni flagi (Brez NOREDRAW, da se okno lahko normalno osveži)
                     UINT uFlags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
 
-                    // 1. Ko se okno PRIKAŽE -> Pripni na vrh
+
                     if (uMsg == WM_SHOWWINDOW && wParam == TRUE) {
                         SetWindowPos(rootTemp, HWND_TOPMOST, 0, 0, 0, 0, uFlags);
                     }
-                    // 2. Ko okno DOBI FOKUS -> Pripni na vrh
+
                     else if (uMsg == WM_ACTIVATE && LOWORD(wParam) != WA_INACTIVE) {
                         SetWindowPos(rootTemp, HWND_TOPMOST, 0, 0, 0, 0, uFlags);
                     }
-                    // 3. Ko preklapljamo med Reaperjem in drugimi programi (npr. Chrome)
+
                     else if (uMsg == WM_ACTIVATEAPP) {
                         if (wParam == TRUE) {
-                            SetWindowPos(rootTemp, HWND_TOPMOST, 0, 0, 0, 0, uFlags); // Nazaj v Reaperju
+                            SetWindowPos(rootTemp, HWND_TOPMOST, 0, 0, 0, 0, uFlags);
                         }
                         else {
-                            SetWindowPos(rootTemp, HWND_NOTOPMOST, 0, 0, 0, 0, uFlags); // Alt+Tab ven iz Reaperja
+                            SetWindowPos(rootTemp, HWND_NOTOPMOST, 0, 0, 0, 0, uFlags);
                         }
                     }
-                    // OPOMBA: WM_SHOWWINDOW z wParam == FALSE namenoma IGNORIRAMO. 
-                    // Reaper ga bo skril sam in s tem preprečimo "Ghost Pin" hrošča!
                 }
             }
         }
@@ -778,7 +787,7 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                 DeleteObject(hSysFont);
                 ReleaseDC(hWnd, hdc);
 
-                UINT dpi = GetDpiForWindow(hWnd);
+                UINT dpi = GetSafeDPI(hWnd);
                 if (dpi == 0) dpi = 96;
                 float dpiScale = (float)dpi / 96.0f;
 
@@ -1195,7 +1204,8 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
 
                 // Dynamic alignment to prevent text shifting
                 DWORD style = GetWindowLong(hWnd, GWL_STYLE);
-                UINT textFormat = DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX;
+                //UINT textFormat = DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX;
+                UINT textFormat = DT_VCENTER | DT_SINGLELINE;
 
                 if ((style & SS_TYPEMASK) == SS_RIGHT) textFormat |= DT_RIGHT;
                 else if ((style & SS_TYPEMASK) == SS_CENTER) textFormat |= DT_CENTER;
@@ -1258,7 +1268,8 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                     RECT rcText = rc;
                     rcText.left += textOffset;
 
-                    DrawTextW(hdc, text, -1, &rcText, DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_NOPREFIX);
+                    //DrawTextW(hdc, text, -1, &rcText, DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_NOPREFIX);
+                    DrawTextW(hdc, text, -1, &rcText, DT_SINGLELINE | DT_LEFT | DT_VCENTER);
 
                     SelectObject(hdc, hOldFont);
                     ReleaseDC(hWnd, hdc);
@@ -1462,6 +1473,7 @@ static WndClass GetWindowClassType(const wchar_t* className) {
     return WND_UNKNOWN;
 }
 
+
 static void StyleWindow(HWND hwnd) {
     // Validation at the very start
     if (!IsWindowValid(hwnd)) {
@@ -1471,12 +1483,10 @@ static void StyleWindow(HWND hwnd) {
     wchar_t className[256] = { 0 };
     if (!GetClassNameW(hwnd, className, 256)) return;
 
-    // --- IGNORE MENUS ---
-    if (wcscmp(className, CLASSNAME_MENU) == 0) return;
-
     // --- IGNORE PYTHON TCL/TK WINDOWS (CRASH FIX) ---
     // Tcl/Tkinter uses its own custom rendering engine. Subclassing these will crash the tcl86t.dll module.
-    if (wcsncmp(className, L"TkTopLevel", 10) == 0 || wcsncmp(className, L"TkChild", 7) == 0) {
+    // v1.0.8: Using case-insensitive search to catch hidden classes like 'TtkMonitorClass'.
+    if (StrStrIW(className, L"tk") != NULL || StrStrIW(className, L"tcl") != NULL) {
         return;
     }
 
@@ -1606,12 +1616,22 @@ static void StyleWindow(HWND hwnd) {
         SetWindowSubclass(hwnd, UniversalSubclassProc, 1, (DWORD_PTR)GetWindowClassType(className));
     }
     else if (wcscmp(className, CLASSNAME_BUTTON) == 0) {
-        DWORD style = GetWindowLong(hwnd, GWL_STYLE) & BS_TYPEMASK;
+        // Preberemo celoten stil gumba
+        DWORD fullStyle = GetWindowLong(hwnd, GWL_STYLE);
+        DWORD typeStyle = fullStyle & BS_TYPEMASK;
 
-        bool isStandardButton = (style == BS_PUSHBUTTON || style == BS_DEFPUSHBUTTON);
-        bool isCheckBox = (style == BS_CHECKBOX || style == BS_AUTOCHECKBOX || style == BS_3STATE || style == BS_AUTO3STATE);
-        bool isRadio = (style == BS_RADIOBUTTON || style == BS_AUTORADIOBUTTON);
-        bool isGroupBox = (style == BS_GROUPBOX);
+        bool isStandardButton = (typeStyle == BS_PUSHBUTTON || typeStyle == BS_DEFPUSHBUTTON);
+        bool isCheckBox = (typeStyle == BS_CHECKBOX || typeStyle == BS_AUTOCHECKBOX || typeStyle == BS_3STATE || typeStyle == BS_AUTO3STATE);
+        bool isRadio = (typeStyle == BS_RADIOBUTTON || typeStyle == BS_AUTORADIOBUTTON);
+        bool isGroupBox = (typeStyle == BS_GROUPBOX);
+
+        // --- UNIVERSAL LEFT-TEXT CHECKBOX SHIELD (v1.0.8 Glitch Fix) ---
+        // Modern Windows themes completely break checkboxes that have text on the left (BS_LEFTTEXT).
+        // This targets the squished Channel boxes in "Filter Events" and anywhere else they appear!
+        if (isCheckBox && (fullStyle & BS_LEFTTEXT)) {
+            SetWindowTheme(hwnd, L"", L""); // Odstrani moderno temo
+            return; // Preskoči subclassing, da ostane klasičen kvadrat
+        }
 
         // --- FAKE LINK RECOGNITION (Early Subclassing) ---
         // Catch the fake links immediately when the window is styled, before any painting occurs.
