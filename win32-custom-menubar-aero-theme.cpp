@@ -722,7 +722,7 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                 }
                 else if (plvcd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
 
-                    // NOVO: Najprej dovolimo Reaperju, da nastavi svoj font (da ohranimo BOLD za aktivni Screenset)
+                    // First allow Reaper to set its font (to preserve BOLD for active Screenset)
                     LRESULT nativeRes = DefSubclassProc(hWnd, uMsg, wParam, lParam);
 
                     bool isSelected = (SendMessage(nmhdr->hwndFrom, 4140, plvcd->nmcd.dwItemSpec, 2) & 2) != 0;
@@ -750,7 +750,6 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                         plvcd->clrTextBk = bgColor;
                         plvcd->clrText = g_TextColor;
 
-                        // Vrnemo nativeRes skupaj z našim flagom, da ohranimo font
                         return nativeRes | CDRF_NEWFONT;
                     }
                 }
@@ -1718,7 +1717,7 @@ static void StyleWindow(HWND hwnd) {
         SetWindowSubclass(hwnd, UniversalSubclassProc, 1, (DWORD_PTR)GetWindowClassType(className));
     }
     else if (wcscmp(className, CLASSNAME_BUTTON) == 0) {
-        // Preberemo celoten stil gumba
+        // Read the full button style
         DWORD fullStyle = GetWindowLong(hwnd, GWL_STYLE);
         DWORD typeStyle = fullStyle & BS_TYPEMASK;
 
@@ -1732,7 +1731,7 @@ static void StyleWindow(HWND hwnd) {
         // This targets the squished Channel boxes in "Filter Events" and anywhere else they appear!
         if (isCheckBox && (fullStyle & BS_LEFTTEXT)) {
             SetWindowTheme(hwnd, L"", L""); // Odstrani moderno temo
-            return; // Preskoči subclassing, da ostane klasičen kvadrat
+            return;
         }
 
         // --- FAKE LINK RECOGNITION (Early Subclassing) ---
