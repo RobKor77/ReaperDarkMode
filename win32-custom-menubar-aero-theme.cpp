@@ -6,7 +6,7 @@ Description:    Provides a full dark mode implementation for Reaper (Windows pla
 
 Author:         Copyright (c) 2026 Rob Kor (Wormhole Labs)
 Created:        2026
-Version:        Release v1.0.8
+Version:        Release v1.1.0
 
 Platform:       Windows 10, Windows 11
 Compiler:       MSVC / Visual Studio
@@ -387,6 +387,61 @@ static void ClipChildWindows(HWND hWnd, HDC hdc) {
     }
 }
 
+// PROTECT CUSTOM GUI CANVASES (Qt5, JUCE, Generic Window) FROM BEING PAINTED OVER
+// We use a struct to safely pass both the main window handle and its HDC into the lambda.
+struct ClipData {
+    HWND hWnd;
+    HDC hdc;
+};
+
+static void ClipFXCanvases(HWND hWnd, HDC hdc) {
+    HWND rootTemp = GetAncestor(hWnd, GA_ROOT);
+    if (!rootTemp) return;
+
+    wchar_t rootTitle[256] = { 0 };
+    SafeGetWindowText(rootTemp, rootTitle, 256);
+
+    // Check if we are inside an FX window (VST, JS, AU, CLAP)
+    if (wcsstr(rootTitle, L"VST") != NULL ||
+        wcsstr(rootTitle, L"JS:") != NULL ||
+        wcsstr(rootTitle, L"AU") != NULL ||
+        wcsstr(rootTitle, L"CLAP") != NULL) {
+
+        ClipData data = { hWnd, hdc };
+
+        EnumChildWindows(hWnd, [](HWND hChild, LPARAM lp) -> BOOL {
+            if (IsWindowVisible(hChild)) {
+                wchar_t childCls[256] = { 0 };
+                GetClassNameW(hChild, childCls, 256);
+
+                // Detect notorious Custom GUI frameworks that glitch when painted over
+                if (wcsncmp(childCls, L"Qt5", 3) == 0 ||
+                    wcsncmp(childCls, L"Qt6", 3) == 0 ||
+                    wcsncmp(childCls, L"JUCE", 4) == 0 ||
+                    wcsncmp(childCls, L"VSTGUI", 6) == 0 ||
+                    wcsncmp(childCls, L"AfxWnd", 6) == 0 ||
+                    wcscmp(childCls, L"Window") == 0) {
+
+                    ClipData* pData = (ClipData*)lp;
+                    RECT rc;
+                    GetWindowRect(hChild, &rc);
+
+                    // CRITICAL FIX: Map coordinates relative to the dialog we are painting (hWnd), 
+                    // not the immediate parent, because the canvas might be deeply nested!
+                    MapWindowPoints(HWND_DESKTOP, pData->hWnd, (LPPOINT)&rc, 2);
+
+                    // Protect against clipping tiny generic buttons named "Window"
+                    if (wcscmp(childCls, L"Window") == 0 && (rc.right - rc.left) < 50) return TRUE;
+
+                    // Cut a hole in the brush exactly where the plugin canvas sits!
+                    ExcludeClipRect(pData->hdc, rc.left, rc.top, rc.right, rc.bottom);
+                }
+            }
+            return TRUE;
+            }, (LPARAM)&data);
+    }
+}
+
 // BRUSH RECOVERY: Protection against rogue plugins invalidating global brushes
 static void EnsureBrushesAreAlive() {
     LOGBRUSH lb;
@@ -655,7 +710,7 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                     }
                 }
             }
-            // --- RIGHT SIDE: General lists (ListView - Actions, FX lists) ---
+            // --- RIGHT SIDE: General lists (ListView - Actions, FX lists, Screensets) ---
             else if (wcscmp(clsName, CLASSNAME_LISTVIEW) == 0) {
                 LPNMLVCUSTOMDRAW plvcd = (LPNMLVCUSTOMDRAW)lParam;
 
@@ -666,6 +721,10 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                     return res | CDRF_NOTIFYITEMDRAW;
                 }
                 else if (plvcd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
+
+                    // NOVO: Najprej dovolimo Reaperju, da nastavi svoj font (da ohranimo BOLD za aktivni Screenset)
+                    LRESULT nativeRes = DefSubclassProc(hWnd, uMsg, wParam, lParam);
+
                     bool isSelected = (SendMessage(nmhdr->hwndFrom, 4140, plvcd->nmcd.dwItemSpec, 2) & 2) != 0;
 
                     if (isSelected) {
@@ -684,13 +743,15 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
 
                         plvcd->nmcd.uItemState &= ~(CDIS_SELECTED | CDIS_FOCUS | CDIS_HOT);
 
-                        return CDRF_NEWFONT;
+                        return nativeRes | CDRF_NEWFONT;
                     }
                     else {
                         COLORREF bgColor = GetWindowBgColor(nmhdr->hwndFrom);
                         plvcd->clrTextBk = bgColor;
                         plvcd->clrText = g_TextColor;
-                        return CDRF_NEWFONT;
+
+                        // Vrnemo nativeRes skupaj z našim flagom, da ohranimo font
+                        return nativeRes | CDRF_NEWFONT;
                     }
                 }
             }
@@ -703,12 +764,39 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
     WndClass classType = (WndClass)dwRefData;
 
     // --- IMMEDIATE LIST REFRESH ON FOCUS CHANGE ---
-    // Forces TreeViews and ListViews to redraw immediately when they gain or lose focus,
-    // ensuring our custom unfocused selection color updates instantly.
+    // Forces TreeViews and ListViews to redraw immediately when they gain or lose focus.
     if (uMsg == WM_SETFOCUS || uMsg == WM_KILLFOCUS) {
         if (classType == WND_TREEVIEW || classType == WND_LISTVIEW) {
             InvalidateRect(hWnd, NULL, FALSE);
             UpdateWindow(hWnd);
+        }
+    }
+    // ----------------------------------------------------------
+
+    // --- AUTO-REFRESH FIX FOR CUSTOM GUI PLUGINS (Qt, JUCE) ---
+    // When a system dialog (e.g., Save As) is closed over a plugin window, the plugin
+    // regains focus/activation. We force a deep repaint of all child elements.
+    // This simulates clicking away and back, fixing the "hover glitch" where native controls
+    // momentarily disappear under our dark background until hovered.
+    if (uMsg == WM_ACTIVATE || uMsg == WM_SETFOCUS) {
+        // Only trigger this if we are dealing with a Dialog (#32770) or the root Reaper window
+        if (classType == WND_DIALOG || classType == WND_REAPERWINDOW) {
+            HWND rootTemp = GetAncestor(hWnd, GA_ROOT);
+            if (rootTemp) {
+                wchar_t rootTitle[256] = { 0 };
+                SafeGetWindowText(rootTemp, rootTitle, 256);
+
+                // Check if this is an FX window
+                if (wcsstr(rootTitle, L"VST") != NULL ||
+                    wcsstr(rootTitle, L"JS:") != NULL ||
+                    wcsstr(rootTitle, L"AU") != NULL ||
+                    wcsstr(rootTitle, L"CLAP") != NULL) {
+
+                    // RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN forces every element
+                    // inside the FX container to aggressively repaint itself immediately.
+                    RedrawWindow(hWnd, NULL, NULL, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+                }
+            }
         }
     }
     // ----------------------------------------------------------
@@ -891,6 +979,7 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                 SetPropW(hWnd, L"IsColorDlg", (HANDLE)1);
                 isColorDlg = true;
             }
+
         }
     }
 
@@ -963,10 +1052,14 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
         return (LRESULT)bgBrush;
     }
     if (uMsg == WM_ERASEBKGND) {
+        // PROTECTION FOR HYBRID WINDOWS: Let the OS draw the native light background!
+        if (GetPropW(hWnd, L"HybridStyled") != NULL) {
+            return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+        }
+
         HWND root = GetAncestor(hWnd, GA_ROOT);
 
         // PROTECTION: If we are painting IN the Color Picker, DO NOT ERASE THE BACKGROUND!
-        // Exit if "Root" is flagged, regardless of which internal window we are in.
         if (root && GetPropW(root, L"IsColorDlg") != NULL) {
             return DefSubclassProc(hWnd, uMsg, wParam, lParam);
         }
@@ -977,11 +1070,14 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
             bool noControls = (FindWindowExW(hWnd, NULL, CLASSNAME_COMBOBOX, NULL) == NULL &&
                 FindWindowExW(hWnd, NULL, CLASSNAME_BUTTON, NULL) == NULL);
 
-            bool isPureToolbarWindow = hasToolbar && noControls;
-
-            if (isPureToolbarWindow) {
+            if (hasToolbar && noControls) {
                 return DefSubclassProc(hWnd, uMsg, wParam, lParam);
             }
+
+            // --- FX CANVAS PROTECTION ---
+            // Clip the drawing area so we don't accidentally erase the VST plugin GUI
+            ClipFXCanvases(hWnd, (HDC)wParam);
+            // ----------------------------
         }
     }
 
@@ -1031,41 +1127,37 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
     if (uMsg == WM_PAINT) {
         HWND rootTemp = GetAncestor(hWnd, GA_ROOT);
 
-        // --- OPTIMIZATION: Check for "Confirm Save As" ONLY on dialogs and ONLY ONCE ---
-        // Calling SafeGetWindowText on every WM_PAINT tick causes severe UI lag (e.g., tracklist scrolling).
+        // --- STRUCTURAL DETECTION OF SYSTEM DIALOGS ONLY (TaskDialogs, MessageBoxes) ---
+        // Keeps System popups native (light) while keeping their title bar dark.
+        // We DO NOT use this for VSTs!
         if (classType == WND_DIALOG) {
-            // Check if we have already tested this specific window to avoid redundant polling
             if (GetPropW(hWnd, L"HybridChecked") == NULL) {
-                SetPropW(hWnd, L"HybridChecked", (HANDLE)1); // Mark as checked
+                SetPropW(hWnd, L"HybridChecked", (HANDLE)1);
 
-                wchar_t wndTitle[256] = { 0 };
-                SafeGetWindowText(hWnd, wndTitle, 256);
+                // 1. Modern TaskDialog (e.g., Confirm Save As)
+                bool isTaskDialog = (FindWindowExW(hWnd, NULL, L"DirectUIHWND", NULL) != NULL);
 
-                if (wcscmp(wndTitle, L"Confirm Save As") == 0) {
-                    if (GetPropW(hWnd, L"HybridStyled") == NULL) {
-                        SetPropW(hWnd, L"HybridStyled", (HANDLE)1);
+                // 2. Classic Win32 Warnings (MessageBox)
+                bool isMessageBox = (GetDlgItem(hWnd, 20) != NULL);
 
-                        // 1. Remove the custom Dark Mode theme from the window content
-                        SetWindowTheme(hWnd, NULL, NULL);
+                if ((isTaskDialog || isMessageBox) && GetPropW(hWnd, L"HybridStyled") == NULL) {
+                    SetPropW(hWnd, L"HybridStyled", (HANDLE)1);
 
-                        // 2. Remove our subclassing from child buttons to make them light again
-                        EnumChildWindows(hWnd, [](HWND hChild, LPARAM lp) -> BOOL {
-                            RemoveWindowSubclass(hChild, UniversalSubclassProc, 1);
-                            RemoveWindowSubclass(hChild, UniversalSubclassProc, 3);
-                            SetWindowTheme(hChild, NULL, NULL);
-                            return TRUE;
-                            }, 0);
+                    SetWindowTheme(hWnd, NULL, NULL);
 
-                        // 3. Re-force the dark title bar via DWM (crucial after theme reset)
-                        DarkenTitleBar(hWnd);
+                    EnumChildWindows(hWnd, [](HWND hChild, LPARAM lp) -> BOOL {
+                        RemoveWindowSubclass(hChild, UniversalSubclassProc, 1);
+                        RemoveWindowSubclass(hChild, UniversalSubclassProc, 2);
+                        RemoveWindowSubclass(hChild, UniversalSubclassProc, 3);
+                        SetWindowTheme(hChild, NULL, NULL);
+                        return TRUE;
+                        }, 0);
 
-                        // Refresh to apply changes immediately
-                        InvalidateRect(hWnd, NULL, TRUE);
-                    }
+                    DarkenTitleBar(hWnd);
+                    InvalidateRect(hWnd, NULL, TRUE);
                 }
             }
 
-            // If the window is flagged as Hybrid, return native drawing immediately
             if (GetPropW(hWnd, L"HybridStyled") != NULL) {
                 return DefSubclassProc(hWnd, uMsg, wParam, lParam);
             }
@@ -1348,6 +1440,14 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
         else if (classType == WND_DIALOG || IsChildOfTabControl(hWnd)) {
             PAINTSTRUCT ps = { 0 };
             HDC hdc = BeginPaint(hWnd, &ps);
+
+            // --- FX CANVAS PROTECTION ---
+            // Prevent the solid dark brush from covering Custom GUI plugins
+            if (classType == WND_DIALOG) {
+                ClipFXCanvases(hWnd, hdc);
+            }
+            // ----------------------------
+
             HBRUSH bgBrush = GetWindowBgBrush(hWnd);
             FillRect(hdc, &ps.rcPaint, bgBrush);
             EndPaint(hWnd, &ps);
@@ -1445,6 +1545,8 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
     if (uMsg == WM_NCDESTROY) {
         RemovePropW(hWnd, L"FakeDisabled");
         RemovePropW(hWnd, L"IsColorDlg");
+        RemovePropW(hWnd, L"HybridStyled");
+        RemovePropW(hWnd, L"HybridChecked");
         RemoveWindowSubclass(hWnd, UniversalSubclassProc, uIdSubclass);
     }
     return DefSubclassProc(hWnd, uMsg, wParam, lParam);
