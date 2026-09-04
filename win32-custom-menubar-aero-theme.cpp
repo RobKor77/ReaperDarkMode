@@ -6,7 +6,7 @@ Description:    Provides a full dark mode implementation for Reaper (Windows pla
 
 Author:         Copyright (c) 2026 Rob Kor (Wormhole Labs)
 Created:        2026
-Version:        Release v1.1.0
+Version:        Release v1.1.1
 
 Platform:       Windows 10, Windows 11
 Compiler:       MSVC / Visual Studio
