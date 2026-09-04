@@ -6,7 +6,7 @@ Description:    Provides a full dark mode implementation for Reaper (Windows pla
 
 Author:         Copyright (c) 2026 Rob Kor (Wormhole Labs)
 Created:        2026
-Version:        Release v1.1.0
+Version:        Release v1.1.1
 
 Platform:       Windows 10, Windows 11
 Compiler:       MSVC / Visual Studio
@@ -579,6 +579,87 @@ static UINT GetSafeDPI(HWND hWnd) {
         ReleaseDC(hWnd, hdc);
     }
     return (dpi == 0) ? 96 : dpi;
+}
+
+// Remap the render-finish dialog's name column from REAPER's light scheme to the
+// dark theme. REAPER draws the per-source names ("Master", track/item names) on
+// the dialog client area in a light background with dark text. This maps each
+// pixel's luminance so the light background becomes g_colorChild and the dark
+// text becomes g_TextColor (the same gray as the status line), with anti-aliased
+// edges blending smoothly. It only touches the name column; the caller keeps the
+// rest of the dialog darkened.
+static void DarkenRendererNames(HWND hWnd, HDC hdc) {
+    HWND hStatus = GetDlgItem(hWnd, 1036);          // "Finished in ..." static
+    HWND hPeaks  = GetDlgItem(hWnd, 1165);          // REAPERminipeaks
+    HWND hMeter  = FindWindowExW(hWnd, NULL, L"REAPERhorzvu", NULL);
+    if (!hStatus || !hPeaks || !hMeter) return;
+
+    RECT rStatus, rPeaks, rMeter;
+    GetWindowRect(hStatus, &rStatus);
+    GetWindowRect(hPeaks, &rPeaks);
+    GetWindowRect(hMeter, &rMeter);
+
+    RECT rc;
+    rc.left   = rStatus.left;
+    rc.right  = rMeter.left;
+    rc.top    = rStatus.bottom + 7;
+    rc.bottom = rPeaks.top - 12;
+    MapWindowPoints(HWND_DESKTOP, hWnd, (LPPOINT)&rc, 2);
+    if (rc.right <= rc.left || rc.bottom <= rc.top) return;
+
+    int w = rc.right - rc.left;
+    int h = rc.bottom - rc.top;
+    if (w <= 0 || h <= 0) return;
+
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h;               // top-down
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void* bits = NULL;
+    HDC mem = CreateCompatibleDC(hdc);
+    HBITMAP dib = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (!dib || !bits) { if (dib) DeleteObject(dib); DeleteDC(mem); return; }
+    HGDIOBJ hOld = SelectObject(mem, dib);
+    BitBlt(mem, 0, 0, w, h, hdc, rc.left, rc.top, SRCCOPY);
+
+    int bgR = GetRValue(g_colorChild), bgG = GetGValue(g_colorChild), bgB = GetBValue(g_colorChild);
+    int txR = GetRValue(g_TextColor),   txG = GetGValue(g_TextColor),   txB = GetBValue(g_TextColor);
+
+    BYTE* row = (BYTE*)bits;
+    for (int y = 0; y < h; ++y) {
+        BYTE* px = row;
+        for (int x = 0; x < w; ++x) {
+            int lum = (px[2] * 299 + px[1] * 587 + px[0] * 114) / 1000;
+            if (lum > 240) lum = 240;
+            px[2] = (BYTE)(txR + (bgR - txR) * lum / 240);
+            px[1] = (BYTE)(txG + (bgG - txG) * lum / 240);
+            px[0] = (BYTE)(txB + (bgB - txB) * lum / 240);
+            px[3] = 0xFF;
+            px += 4;
+        }
+        row += w * 4;
+    }
+
+    BitBlt(hdc, rc.left, rc.top, w, h, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, hOld);
+    DeleteObject(dib);
+    DeleteDC(mem);
+
+    // REAPER draws a thin light separator band across the bottom of the name
+    // column after the remap. Cover it with the dialog background color so the
+    // column ends cleanly on dark, matching the status line.
+    HBRUSH cover = CreateSolidBrush(g_colorChild);
+    RECT rcCover;
+    rcCover.left   = rc.left;
+    rcCover.right  = rc.right;
+    rcCover.top    = rc.bottom - 5;
+    rcCover.bottom = rc.bottom;
+    FillRect(hdc, &rcCover, cover);
+    DeleteObject(cover);
 }
 
 
@@ -1437,6 +1518,58 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
             return 0;
         }
         else if (classType == WND_DIALOG || IsChildOfTabControl(hWnd)) {
+            // RENDER FINISHED DIALOG: keep the author's dark background everywhere,
+            // but let the per-source names show. REAPER draws those names in its
+            // light scheme on the dialog client area (left of the level meters),
+            // which the plain FillRect below would cover. So: let REAPER paint the
+            // whole dialog first, then fill the dark background over everything
+            // EXCEPT the name column, and finally remap the name column to dark
+            // (light bg -> g_colorChild, dark text -> g_TextColor), leaving the
+            // rest of the dialog exactly as the author darkens it.
+            if (classType == WND_DIALOG &&
+                FindWindowExW(hWnd, NULL, L"REAPERminipeaks", NULL) != NULL) {
+                LRESULT res = DefSubclassProc(hWnd, uMsg, wParam, lParam);
+
+                // Fill the dark background over the rest of the dialog, excluding
+                // the name column so REAPER's names are not painted over.
+                HWND hStatus = GetDlgItem(hWnd, 1036);   // "Finished in ..." static
+                HWND hPeaks  = GetDlgItem(hWnd, 1165);   // REAPERminipeaks
+                HWND hMeter  = FindWindowExW(hWnd, NULL, L"REAPERhorzvu", NULL);
+                if (hStatus && hPeaks && hMeter) {
+                    RECT rStatus, rPeaks, rMeter;
+                    GetWindowRect(hStatus, &rStatus);
+                    GetWindowRect(hPeaks, &rPeaks);
+                    GetWindowRect(hMeter, &rMeter);
+
+                    HDC hdc = GetDC(hWnd);
+
+                    // The name column rectangle in client coordinates.
+                    RECT rcName;
+                    rcName.left   = rStatus.left;
+                    rcName.right  = rMeter.left;
+                    rcName.top    = rStatus.bottom + 7;
+                    rcName.bottom = rPeaks.top - 12;
+                    MapWindowPoints(HWND_DESKTOP, hWnd, (LPPOINT)&rcName, 2);
+
+                    // Darken the rest of the dialog client area, leaving the name
+                    // column untouched so REAPER's drawing stays.
+                    RECT rcAll;
+                    GetClientRect(hWnd, &rcAll);
+                    ExcludeClipRect(hdc, rcName.left, rcName.top, rcName.right, rcName.bottom);
+                    HBRUSH bg = CreateSolidBrush(g_colorChild);
+                    FillRect(hdc, &rcAll, bg);
+                    DeleteObject(bg);
+                    SelectClipRgn(hdc, NULL);
+                    ReleaseDC(hWnd, hdc);
+
+                    // Remap the name column to dark theme.
+                    hdc = GetDC(hWnd);
+                    DarkenRendererNames(hWnd, hdc);
+                    ReleaseDC(hWnd, hdc);
+                }
+                return res;
+            }
+
             PAINTSTRUCT ps = { 0 };
             HDC hdc = BeginPaint(hWnd, &ps);
 
