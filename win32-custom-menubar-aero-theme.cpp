@@ -648,6 +648,18 @@ static void DarkenRendererNames(HWND hWnd, HDC hdc) {
     SelectObject(mem, hOld);
     DeleteObject(dib);
     DeleteDC(mem);
+
+    // REAPER draws a thin light separator band across the bottom of the name
+    // column after the remap. Cover it with the dialog background color so the
+    // column ends cleanly on dark, matching the status line.
+    HBRUSH cover = CreateSolidBrush(g_colorChild);
+    RECT rcCover;
+    rcCover.left   = rc.left;
+    rcCover.right  = rc.right;
+    rcCover.top    = rc.bottom - 5;
+    rcCover.bottom = rc.bottom;
+    FillRect(hdc, &rcCover, cover);
+    DeleteObject(cover);
 }
 
 
