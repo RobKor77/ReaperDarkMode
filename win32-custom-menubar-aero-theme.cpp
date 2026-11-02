@@ -6,7 +6,7 @@ Description:    Provides a full dark mode implementation for Reaper (Windows pla
 
 Author:         Copyright (c) 2026 Rob Kor (Wormhole Labs)
 Created:        2026
-Version:        Release v1.1.0
+Version:        Release v1.1.2
 
 Platform:       Windows 10, Windows 11
 Compiler:       MSVC / Visual Studio
@@ -257,7 +257,7 @@ static BOOL IsChildOfTabControl(HWND hWnd);
 static COLORREF GetWindowBgColor(HWND hWnd) {
     HWND root = GetAncestor(hWnd, GA_ROOT);
     if (root) {
-        wchar_t title[256] = { 0 };
+        //wchar_t title[256] = { 0 };
 
         // Use the structural property assigned by StyleWindow for system dialogs
         if (GetPropW(root, L"IsFileDialog") != NULL) {
@@ -290,10 +290,10 @@ static COLORREF GetWindowBgColor(HWND hWnd) {
 static HBRUSH GetWindowBgBrush(HWND hWnd) {
     HWND root = GetAncestor(hWnd, GA_ROOT);
     if (root) {
-        wchar_t title[256] = { 0 };
+        //wchar_t title[256] = { 0 };
 
         // Use safe retrieval instead of GetWindowTextW
-        SafeGetWindowText(root, title, 256);
+        //SafeGetWindowText(root, title, 256);
 
         // Use the structural property assigned by StyleWindow for system dialogs
         if (GetPropW(root, L"IsFileDialog") != NULL) {
@@ -398,48 +398,45 @@ static void ClipFXCanvases(HWND hWnd, HDC hdc) {
     HWND rootTemp = GetAncestor(hWnd, GA_ROOT);
     if (!rootTemp) return;
 
-    wchar_t rootTitle[256] = { 0 };
-    SafeGetWindowText(rootTemp, rootTitle, 256);
-
-    // Check if we are inside an FX window (VST, JS, AU, CLAP)
-    if (wcsstr(rootTitle, L"VST") != NULL ||
-        wcsstr(rootTitle, L"JS:") != NULL ||
-        wcsstr(rootTitle, L"AU") != NULL ||
-        wcsstr(rootTitle, L"CLAP") != NULL) {
-
-        ClipData data = { hWnd, hdc };
-
-        EnumChildWindows(hWnd, [](HWND hChild, LPARAM lp) -> BOOL {
-            if (IsWindowVisible(hChild)) {
-                wchar_t childCls[256] = { 0 };
-                GetClassNameW(hChild, childCls, 256);
-
-                // Detect notorious Custom GUI frameworks that glitch when painted over
-                if (wcsncmp(childCls, L"Qt5", 3) == 0 ||
-                    wcsncmp(childCls, L"Qt6", 3) == 0 ||
-                    wcsncmp(childCls, L"JUCE", 4) == 0 ||
-                    wcsncmp(childCls, L"VSTGUI", 6) == 0 ||
-                    wcsncmp(childCls, L"AfxWnd", 6) == 0 ||
-                    wcscmp(childCls, L"Window") == 0) {
-
-                    ClipData* pData = (ClipData*)lp;
-                    RECT rc;
-                    GetWindowRect(hChild, &rc);
-
-                    // CRITICAL FIX: Map coordinates relative to the dialog we are painting (hWnd), 
-                    // not the immediate parent, because the canvas might be deeply nested!
-                    MapWindowPoints(HWND_DESKTOP, pData->hWnd, (LPPOINT)&rc, 2);
-
-                    // Protect against clipping tiny generic buttons named "Window"
-                    if (wcscmp(childCls, L"Window") == 0 && (rc.right - rc.left) < 50) return TRUE;
-
-                    // Cut a hole in the brush exactly where the plugin canvas sits!
-                    ExcludeClipRect(pData->hdc, rc.left, rc.top, rc.right, rc.bottom);
-                }
-            }
-            return TRUE;
-            }, (LPARAM)&data);
+    // --- ULTRA-FAST CACHE CHECK ---
+    // Instead of reading the window title 60 times a second (which causes severe lag 
+    // on 4K scaled monitors), we instantly check for our invisible RAM flag!
+    if (GetPropW(rootTemp, L"IsFXContainer") == NULL) {
+        return;
     }
+    // ------------------------------
+
+    ClipData data = { hWnd, hdc };
+
+    EnumChildWindows(hWnd, [](HWND hChild, LPARAM lp) -> BOOL {
+        if (IsWindowVisible(hChild)) {
+            wchar_t childCls[256] = { 0 };
+            GetClassNameW(hChild, childCls, 256);
+
+            // Detect notorious Custom GUI frameworks that glitch when painted over
+            if (wcsncmp(childCls, L"Qt5", 3) == 0 ||
+                wcsncmp(childCls, L"Qt6", 3) == 0 ||
+                wcsncmp(childCls, L"JUCE", 4) == 0 ||
+                wcsncmp(childCls, L"VSTGUI", 6) == 0 ||
+                wcsncmp(childCls, L"AfxWnd", 6) == 0 ||
+                wcscmp(childCls, L"Window") == 0) {
+
+                ClipData* pData = (ClipData*)lp;
+                RECT rc;
+                GetWindowRect(hChild, &rc);
+
+                // Map coordinates relative to the dialog we are painting (hWnd)
+                MapWindowPoints(HWND_DESKTOP, pData->hWnd, (LPPOINT)&rc, 2);
+
+                // Protect against clipping tiny generic buttons named "Window"
+                if (wcscmp(childCls, L"Window") == 0 && (rc.right - rc.left) < 50) return TRUE;
+
+                // Cut a hole in the brush exactly where the plugin canvas sits!
+                ExcludeClipRect(pData->hdc, rc.left, rc.top, rc.right, rc.bottom);
+            }
+        }
+        return TRUE;
+        }, (LPARAM)&data);
 }
 
 // BRUSH RECOVERY: Protection against rogue plugins invalidating global brushes
@@ -581,17 +578,121 @@ static UINT GetSafeDPI(HWND hWnd) {
     return (dpi == 0) ? 96 : dpi;
 }
 
+// Remap the render-finish dialog's name column from REAPER's light scheme to the
+// dark theme. REAPER draws the per-source names ("Master", track/item names) on
+// the dialog client area in a light background with dark text. This maps each
+// pixel's luminance so the light background becomes g_colorChild and the dark
+// text becomes g_TextColor (the same gray as the status line), with anti-aliased
+// edges blending smoothly. It only touches the name column; the caller keeps the
+// rest of the dialog darkened.
+static void DarkenRendererNames(HWND hWnd, HDC hdc) {
+    HWND hStatus = GetDlgItem(hWnd, 1036);          // "Finished in ..." static
+    HWND hPeaks = GetDlgItem(hWnd, 1165);          // REAPERminipeaks
+    HWND hMeter = FindWindowExW(hWnd, NULL, L"REAPERhorzvu", NULL);
+    if (!hStatus || !hPeaks || !hMeter) return;
+
+    RECT rStatus, rPeaks, rMeter;
+    GetWindowRect(hStatus, &rStatus);
+    GetWindowRect(hPeaks, &rPeaks);
+    GetWindowRect(hMeter, &rMeter);
+
+    RECT rc;
+    rc.left = rStatus.left;
+    rc.right = rMeter.left;
+    rc.top = rStatus.bottom + 7;
+    rc.bottom = rPeaks.top - 12;
+    MapWindowPoints(HWND_DESKTOP, hWnd, (LPPOINT)&rc, 2);
+    if (rc.right <= rc.left || rc.bottom <= rc.top) return;
+
+    int w = rc.right - rc.left;
+    int h = rc.bottom - rc.top;
+    if (w <= 0 || h <= 0) return;
+
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h;               // top-down
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void* bits = NULL;
+    HDC mem = CreateCompatibleDC(hdc);
+    HBITMAP dib = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (!dib || !bits) { if (dib) DeleteObject(dib); DeleteDC(mem); return; }
+    HGDIOBJ hOld = SelectObject(mem, dib);
+    BitBlt(mem, 0, 0, w, h, hdc, rc.left, rc.top, SRCCOPY);
+
+    int bgR = GetRValue(g_colorChild), bgG = GetGValue(g_colorChild), bgB = GetBValue(g_colorChild);
+    int txR = GetRValue(g_TextColor), txG = GetGValue(g_TextColor), txB = GetBValue(g_TextColor);
+
+    BYTE* row = (BYTE*)bits;
+    for (int y = 0; y < h; ++y) {
+        BYTE* px = row;
+        for (int x = 0; x < w; ++x) {
+            int lum = (px[2] * 299 + px[1] * 587 + px[0] * 114) / 1000;
+            if (lum > 240) lum = 240;
+            px[2] = (BYTE)(txR + (bgR - txR) * lum / 240);
+            px[1] = (BYTE)(txG + (bgG - txG) * lum / 240);
+            px[0] = (BYTE)(txB + (bgB - txB) * lum / 240);
+            px[3] = 0xFF;
+            px += 4;
+        }
+        row += w * 4;
+    }
+
+    BitBlt(hdc, rc.left, rc.top, w, h, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, hOld);
+    DeleteObject(dib);
+    DeleteDC(mem);
+
+    // REAPER draws a thin light separator band across the bottom of the name
+    // column after the remap. Cover it with the dialog background color so the
+    // column ends cleanly on dark, matching the status line.
+    HBRUSH cover = CreateSolidBrush(g_colorChild);
+    RECT rcCover;
+    rcCover.left = rc.left;
+    rcCover.right = rc.right;
+    rcCover.top = rc.bottom - 5;
+    rcCover.bottom = rc.bottom;
+    FillRect(hdc, &rcCover, cover);
+    DeleteObject(cover);
+}
+
 
 static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
+
+    if (uMsg == WM_INITDIALOG || uMsg == WM_SHOWWINDOW || uMsg == WM_ACTIVATE) {
+        if (FindWindowExW(hWnd, NULL, L"DUIViewWndClassName", NULL) != NULL ||
+            FindWindowExW(hWnd, NULL, L"DirectUIHWND", NULL) != NULL) {
+
+            for (int i = 1; i <= 8; i++) {
+                RemoveWindowSubclass(hWnd, UniversalSubclassProc, i);
+            }
+            return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+        }
+    }
+    // -----------------------------------------------------------
+
     LRESULT lr = 0;
     if (UAHWndProc(hWnd, uMsg, wParam, lParam, &lr)) return lr;
 
-    // --- SAFETY GUARD ---
-    // Validate brush handles only on paint-related messages
-    if (uMsg == WM_PAINT || uMsg == WM_ERASEBKGND || uMsg == WM_CTLCOLORDLG ||
-        uMsg == WM_CTLCOLORSTATIC || uMsg == WM_CTLCOLORBTN ||
-        uMsg == WM_CTLCOLOREDIT || uMsg == WM_CTLCOLORLISTBOX) {
-        EnsureBrushesAreAlive();
+    if (dwRefData == WND_DIALOG) {
+        if (uMsg == WM_INITDIALOG || uMsg == WM_SHOWWINDOW) {
+            if (FindWindowExW(hWnd, NULL, L"DirectUIHWND", NULL) ||
+                FindWindowExW(hWnd, NULL, L"DUIViewWndClassName", NULL)) {
+
+                SetPropW(hWnd, L"IsFileDialog", (HANDLE)1);
+
+                RemoveWindowSubclass(hWnd, UniversalSubclassProc, uIdSubclass);
+                return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+            }
+        }
+
+        if (GetPropW(hWnd, L"IsFileDialog") != NULL) {
+            RemoveWindowSubclass(hWnd, UniversalSubclassProc, uIdSubclass);
+            return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+        }
     }
 
     // --- AVTOMATIC PINNING OF NON-MIXER WINDOWS (CONFIG IN INI) ---
@@ -650,16 +751,22 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                     // Hide native dotted focus lines
                     SendMessage(nmhdr->hwndFrom, 0x0127 /*WM_CHANGEUISTATE*/, MAKEWPARAM(1, 1), 0);
 
+                    COLORREF bgColor = GetWindowBgColor(nmhdr->hwndFrom);
+                    HBRUSH hBrush = CreateSolidBrush(bgColor);
+                    FillRect(ptvcd->nmcd.hdc, &ptvcd->nmcd.rc, hBrush);
+                    DeleteObject(hBrush);
+                    // -------------------------------------------------------------------------------
+
                     LRESULT res = DefSubclassProc(hWnd, uMsg, wParam, lParam);
                     return res | CDRF_NOTIFYITEMDRAW;
                 }
                 else if (ptvcd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
                     bool isActuallySelected = (SendMessage(nmhdr->hwndFrom, 4391, ptvcd->nmcd.dwItemSpec, 2) & 2) != 0;
+                    COLORREF bgColor = GetWindowBgColor(nmhdr->hwndFrom);
 
                     if (isActuallySelected) {
-                        COLORREF normalBg = GetWindowBgColor(nmhdr->hwndFrom);
-                        ptvcd->clrText = normalBg;
-                        ptvcd->clrTextBk = normalBg;
+                        ptvcd->clrText = bgColor;
+                        ptvcd->clrTextBk = bgColor;
 
                         ptvcd->nmcd.uItemState &= ~(CDIS_SELECTED | CDIS_FOCUS | CDIS_HOT);
 
@@ -668,7 +775,14 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                     else {
                         // Normal not-selected element
                         ptvcd->clrText = g_TextColor;
-                        ptvcd->clrTextBk = GetWindowBgColor(nmhdr->hwndFrom);
+                        ptvcd->clrTextBk = bgColor;
+
+                        // Draw bg manually
+                        HBRUSH hBrush = CreateSolidBrush(bgColor);
+                        FillRect(ptvcd->nmcd.hdc, &ptvcd->nmcd.rc, hBrush);
+                        DeleteObject(hBrush);
+                        // -----------------------------------------
+
                         return CDRF_NEWFONT;
                     }
                 }
@@ -773,32 +887,22 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
     // ----------------------------------------------------------
 
     // --- AUTO-REFRESH FIX FOR CUSTOM GUI PLUGINS (Qt, JUCE) ---
-    // When a system dialog (e.g., Save As) is closed over a plugin window, the plugin
-    // regains focus/activation. We force a deep repaint of all child elements.
-    // This simulates clicking away and back, fixing the "hover glitch" where native controls
-    // momentarily disappear under our dark background until hovered.
+    // Universal solution: Refreshes ALL standalone floating windows without searching for strings.
     if (uMsg == WM_ACTIVATE || uMsg == WM_SETFOCUS) {
-        // Only trigger this if we are dealing with a Dialog (#32770) or the root Reaper window
         if (classType == WND_DIALOG || classType == WND_REAPERWINDOW) {
             HWND rootTemp = GetAncestor(hWnd, GA_ROOT);
             if (rootTemp) {
-                wchar_t rootTitle[256] = { 0 };
-                SafeGetWindowText(rootTemp, rootTitle, 256);
 
-                // Check if this is an FX window
-                if (wcsstr(rootTitle, L"VST") != NULL ||
-                    wcsstr(rootTitle, L"JS:") != NULL ||
-                    wcsstr(rootTitle, L"AU") != NULL ||
-                    wcsstr(rootTitle, L"CLAP") != NULL) {
-
-                    // RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN forces every element
-                    // inside the FX container to aggressively repaint itself immediately.
+                // GENERAL FILTER: If the window's root is NOT the main REAPER window,
+                // it means it is a standalone floating window (Preferences, Add FX, Floating VST, etc.).
+                // We refresh it unconditionally.
+                if (rootTemp != g_ReaperMainWindow)
+                {
                     RedrawWindow(hWnd, NULL, NULL, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
                 }
             }
         }
     }
-    // ----------------------------------------------------------
 
     // --- SAFE SHUTDOWN CLEANUP ---
     if (uMsg == WM_DESTROY && hWnd == g_ReaperMainWindow) {
@@ -991,33 +1095,47 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
 
         HWND root = GetAncestor(hWnd, GA_ROOT);
         if (hWnd == root) {
-            int curtainDelay = 1;// global minimal delay to prevent system dialog flicker
-
-            wchar_t rootTitle[256] = { 0 };
-            GetWindowTextW(hWnd, rootTitle, 256);
-
-            if (wcsstr(rootTitle, L"FX:") != NULL ||
-                wcsstr(rootTitle, L"Chain") != NULL ||
-                wcsstr(rootTitle, L"Container") != NULL ||
-                wcsstr(rootTitle, L"VST:") != NULL ||
-                wcsstr(rootTitle, L"VST3:") != NULL ||
-                wcsstr(rootTitle, L"AU:") != NULL ||
-                wcsstr(rootTitle, L"JS:") != NULL ||
-                wcsstr(rootTitle, L"CLAP:") != NULL) {
-
-                curtainDelay = 0; // no LAG for these windows
+            // 1. CURTAIN ALWAYS ON FOR ALL WINDOWS (Flicker prevention)
+            // We apply the 1ms layered transparency to all windows, including VSTs,
+            // to prevent the ugly white flash before our dark background loads.
+            LONG exStyle = GetWindowLong(hWnd, GWL_EXSTYLE);
+            if ((exStyle & WS_EX_LAYERED) == 0) {
+                SetWindowLong(hWnd, GWL_EXSTYLE, exStyle | WS_EX_LAYERED);
+                SetLayeredWindowAttributes(hWnd, 0, 0, LWA_ALPHA);
+                SetWindowPos(hWnd, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
             }
+            SetTimer(hWnd, 8888, 0, UncloakTimerProc); // dummy delay 0 ms
 
-            if (curtainDelay > 0) {
-                LONG exStyle = GetWindowLong(hWnd, GWL_EXSTYLE);
-                if ((exStyle & WS_EX_LAYERED) == 0) {
-                    SetWindowLong(hWnd, GWL_EXSTYLE, exStyle | WS_EX_LAYERED);
-                    SetLayeredWindowAttributes(hWnd, 0, 0, LWA_ALPHA);
+            // 2. STRUCTURAL PLUGIN DETECTION (No string matching!)
+            if (GetPropW(hWnd, L"IsFXContainer") == NULL) {
+                EnumChildWindows(hWnd, [](HWND hChild, LPARAM lp) -> BOOL {
+                    wchar_t childCls[256] = { 0 };
+                    GetClassNameW(hChild, childCls, 256);
 
-                    SetWindowPos(hWnd, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-                }
+                    bool isCanvas = false;
+                    if (wcsncmp(childCls, L"Qt5", 3) == 0 ||
+                        wcsncmp(childCls, L"Qt6", 3) == 0 ||
+                        wcsncmp(childCls, L"JUCE", 4) == 0 ||
+                        wcsncmp(childCls, L"VSTGUI", 6) == 0 ||
+                        wcsncmp(childCls, L"AfxWnd", 6) == 0) {
+                        isCanvas = true;
+                    }
+                    else if (wcscmp(childCls, L"Window") == 0) {
+                        RECT rc;
+                        GetWindowRect(hChild, &rc);
+                        // Safety filter: Ignore small REAPER native buttons (width < 50px)!
+                        // Only genuinely large generic windows represent custom plugin canvases (e.g., Bridged plugins).
+                        if ((rc.right - rc.left) > 50) {
+                            isCanvas = true;
+                        }
+                    }
 
-                SetTimer(hWnd, 8888, curtainDelay, UncloakTimerProc);
+                    if (isCanvas) {
+                        SetPropW((HWND)lp, L"IsFXContainer", (HANDLE)1);
+                        return FALSE; // Platno najdeno, ustavi iskanje!
+                    }
+                    return TRUE;
+                    }, (LPARAM)hWnd);
             }
         }
 
@@ -1437,6 +1555,58 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
             return 0;
         }
         else if (classType == WND_DIALOG || IsChildOfTabControl(hWnd)) {
+            // RENDER FINISHED DIALOG: keep the author's dark background everywhere,
+            // but let the per-source names show. REAPER draws those names in its
+            // light scheme on the dialog client area (left of the level meters),
+            // which the plain FillRect below would cover. So: let REAPER paint the
+            // whole dialog first, then fill the dark background over everything
+            // EXCEPT the name column, and finally remap the name column to dark
+            // (light bg -> g_colorChild, dark text -> g_TextColor), leaving the
+            // rest of the dialog exactly as the author darkens it.
+            if (classType == WND_DIALOG &&
+                FindWindowExW(hWnd, NULL, L"REAPERminipeaks", NULL) != NULL) {
+                LRESULT res = DefSubclassProc(hWnd, uMsg, wParam, lParam);
+
+                // Fill the dark background over the rest of the dialog, excluding
+                // the name column so REAPER's names are not painted over.
+                HWND hStatus = GetDlgItem(hWnd, 1036);   // "Finished in ..." static
+                HWND hPeaks = GetDlgItem(hWnd, 1165);   // REAPERminipeaks
+                HWND hMeter = FindWindowExW(hWnd, NULL, L"REAPERhorzvu", NULL);
+                if (hStatus && hPeaks && hMeter) {
+                    RECT rStatus, rPeaks, rMeter;
+                    GetWindowRect(hStatus, &rStatus);
+                    GetWindowRect(hPeaks, &rPeaks);
+                    GetWindowRect(hMeter, &rMeter);
+
+                    HDC hdc = GetDC(hWnd);
+
+                    // The name column rectangle in client coordinates.
+                    RECT rcName;
+                    rcName.left = rStatus.left;
+                    rcName.right = rMeter.left;
+                    rcName.top = rStatus.bottom + 7;
+                    rcName.bottom = rPeaks.top - 12;
+                    MapWindowPoints(HWND_DESKTOP, hWnd, (LPPOINT)&rcName, 2);
+
+                    // Darken the rest of the dialog client area, leaving the name
+                    // column untouched so REAPER's drawing stays.
+                    RECT rcAll;
+                    GetClientRect(hWnd, &rcAll);
+                    ExcludeClipRect(hdc, rcName.left, rcName.top, rcName.right, rcName.bottom);
+                    HBRUSH bg = CreateSolidBrush(g_colorChild);
+                    FillRect(hdc, &rcAll, bg);
+                    DeleteObject(bg);
+                    SelectClipRgn(hdc, NULL);
+                    ReleaseDC(hWnd, hdc);
+
+                    // Remap the name column to dark theme.
+                    hdc = GetDC(hWnd);
+                    DarkenRendererNames(hWnd, hdc);
+                    ReleaseDC(hWnd, hdc);
+                }
+                return res;
+            }
+
             PAINTSTRUCT ps = { 0 };
             HDC hdc = BeginPaint(hWnd, &ps);
 
@@ -1546,6 +1716,7 @@ static LRESULT CALLBACK UniversalSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
         RemovePropW(hWnd, L"IsColorDlg");
         RemovePropW(hWnd, L"HybridStyled");
         RemovePropW(hWnd, L"HybridChecked");
+        RemovePropW(hWnd, L"IsFXContainer"); // Added memory cleanup for Cache Flag
         RemoveWindowSubclass(hWnd, UniversalSubclassProc, uIdSubclass);
     }
     return DefSubclassProc(hWnd, uMsg, wParam, lParam);
@@ -1576,102 +1747,59 @@ static WndClass GetWindowClassType(const wchar_t* className) {
 
 
 static void StyleWindow(HWND hwnd) {
-    // Validation at the very start
-    if (!IsWindowValid(hwnd)) {
-        return;  // Exit if window is invalid
+    if (!IsWindowValid(hwnd)) return;
+
+    // --- 1. STANOV PRISTOP: POPOLNO IGNORIRANJE OS DIALOGOV (Open/Save) ---
+    // Takoj poiščemo glavno okno in preverimo njegov izvorni modul.
+    // S tem definiramo spremenljivko 'root', ki jo uporabljamo v celotni funkciji.
+    HWND root = GetAncestor(hwnd, GA_ROOT);
+    if (root) {
+        HINSTANCE hRootInst = (HINSTANCE)GetWindowLongPtr(root, GWLP_HINSTANCE);
+        wchar_t rootModule[MAX_PATH] = { 0 };
+
+        if (GetModuleFileNameW(hRootInst, rootModule, MAX_PATH)) {
+            // Če je okno ustvarila sistemska knjižnica za datoteke, ga takoj in v celoti prepustimo OS-u!
+            if (StrStrIW(rootModule, L"comdlg32.dll") != NULL ||
+                StrStrIW(rootModule, L"windows.storage.dll") != NULL ||
+                StrStrIW(rootModule, L"shell32.dll") != NULL ||
+                StrStrIW(rootModule, L"explorerframe.dll") != NULL) {
+                return; // Noben subclass ali tema ne bo aplicirana na to okno in njegove otroke.
+            }
+        }
     }
+    // ----------------------------------------------------------------------
 
     wchar_t className[256] = { 0 };
     if (!GetClassNameW(hwnd, className, 256)) return;
 
-    // --- IGNORE PYTHON TCL/TK WINDOWS (CRASH FIX) ---
-    // Tcl/Tkinter uses its own custom rendering engine. Subclassing these will crash the tcl86t.dll module.
-    // v1.0.8: Using case-insensitive search to catch hidden classes like 'TtkMonitorClass'.
+    // Ignoriramo Tcl/Tk Python okna
     if (StrStrIW(className, L"tk") != NULL || StrStrIW(className, L"tcl") != NULL) {
         return;
     }
 
-    // --- PROTECT FLOATING OVERLAYS (MIDI Razor Edit) ---
+    // Ignoriramo plavajoča orodja (MIDI Razor Edit)
     LONG wndStyle = GetWindowLong(hwnd, GWL_STYLE);
     if ((wndStyle & WS_POPUP) && !(wndStyle & WS_CAPTION)) {
         wchar_t wndTitle[256] = { 0 };
-
-        // Safe title check for floating windows
         SafeGetWindowText(hwnd, wndTitle, 256);
-
-        if (wcslen(wndTitle) == 0) {
-            return;
-        }
+        if (wcslen(wndTitle) == 0) return;
     }
-    // ---------------------------------------------------
-
-    HWND root = GetAncestor(hwnd, GA_ROOT);
 
     // --- HYBRID DIALOG CHECK (Confirm Save As) ---
-    // If the root window is tagged for hybrid styling, skip dark mode for content
     if (root && GetPropW(root, L"IsHybridWindow") != NULL) {
-        // We still allow the title bar to be darkened in StyleWindow logic
         if (hwnd == root) {
             DarkenTitleBar(hwnd);
         }
-        return; // Skip further dark subclassing for the window and its children
+        return;
     }
 
-    // --- SMART DETECTION "SAVE/OPEN" WND ---
-    bool isFileDialog = false;
-    if (root) {
-        if (GetPropW(root, L"IsFileDialog") != NULL) {
-            isFileDialog = true;
-        }
-        else {
-            if (FindWindowExW(root, NULL, CLASSNAME_DUI_VIEW, NULL) != NULL) {
-                SetPropW(root, L"IsFileDialog", (HANDLE)1);
-                isFileDialog = true;
-            }
-        }
-    }
-
-    if (isFileDialog) {
-        // 1. Root window and the main title bar remain Native to avoid breaking the gradient!
-        if (hwnd == root) {
-            if (AllowDarkModeForWindow) AllowDarkModeForWindow(hwnd, true);
-            DarkenTitleBar(hwnd);
-            return;
-        }
-
-        // The only part of the window we subclass is the REAPER panel with checkboxes!
-        if (wcscmp(className, CLASSNAME_DIALOG) == 0) {
-            SetWindowTheme(hwnd, L"DarkMode_Explorer", NULL);
-            SetWindowSubclass(hwnd, UniversalSubclassProc, 1, (DWORD_PTR)GetWindowClassType(className));
-            return;
-        }
-
-        // First check if buttons and labels belong to the REAPER panel.
-        bool isReaperPanelElement = false;
-        HWND parent = GetParent(hwnd);
-        while (parent && parent != root) {
-            wchar_t pClass[256] = { 0 };
-            GetClassName(parent, pClass, 256);
-            if (wcscmp(pClass, CLASSNAME_DIALOG) == 0) {
-                isReaperPanelElement = true;
-                break;
-            }
-            parent = GetParent(parent);
-        }
-
-        // If it's not a Reaper button, but a native Windows window element (e.g., Hide Folders), skip it!
-        if (!isReaperPanelElement) {
-            return;
-        }
-    }
+    // (Vsi stari "isFileDialog" bloki so odstranjeni, ker Stanov pristop to reši zgoraj!)
 
     // --- DARKEN TITLEBAR ---
     if (root && hwnd == root) {
         DarkenTitleBar(hwnd);
 
-        // UNIVERSAL FIX FOR ALL MENUS (Including Media Explorer):
-        // If Windows reports that this window has a system menu (GetMenu),
-        // we must subclass it to trigger UAHMenuBar for the dark theme!
+        // UNIVERSAL FIX FOR ALL MENUS (Including Media Explorer)
         if (GetMenu(hwnd) != NULL) {
             SetWindowTheme(hwnd, L"DarkMode_Explorer", NULL);
             SetWindowSubclass(hwnd, UniversalSubclassProc, 1, (DWORD_PTR)GetWindowClassType(className));
@@ -1689,7 +1817,7 @@ static void StyleWindow(HWND hwnd) {
         SetWindowSubclass(hwnd, UniversalSubclassProc, 1, (DWORD_PTR)GetWindowClassType(className));
     }
 
-    if (AllowDarkModeForWindow) {
+    if (AllowDarkModeForWindow && wcscmp(className, CLASSNAME_LISTBOX) != 0) {
         AllowDarkModeForWindow(hwnd, true);
     }
 
@@ -1727,15 +1855,12 @@ static void StyleWindow(HWND hwnd) {
         bool isGroupBox = (typeStyle == BS_GROUPBOX);
 
         // --- UNIVERSAL LEFT-TEXT CHECKBOX SHIELD (v1.0.8 Glitch Fix) ---
-        // Modern Windows themes completely break checkboxes that have text on the left (BS_LEFTTEXT).
-        // This targets the squished Channel boxes in "Filter Events" and anywhere else they appear!
         if (isCheckBox && (fullStyle & BS_LEFTTEXT)) {
-            SetWindowTheme(hwnd, L"", L""); // Odstrani moderno temo
+            SetWindowTheme(hwnd, L"", L"");
             return;
         }
 
         // --- FAKE LINK RECOGNITION (Early Subclassing) ---
-        // Catch the fake links immediately when the window is styled, before any painting occurs.
         if (!isStandardButton && !isCheckBox && !isRadio && !isGroupBox) {
             if (!GetPropW(hwnd, L"SubclassedAsLink")) {
                 SetPropW(hwnd, L"SubclassedAsLink", (HANDLE)1);
@@ -1762,8 +1887,6 @@ static void StyleWindow(HWND hwnd) {
         }
         else if (isStandardButton) {
             SetWindowTheme(hwnd, L"DarkMode_Explorer", NULL);
-            // VERY IMPORTANT: DO NOT call SubclassProc here!
-            // This prevents our WM_PAINT function from breaking the rendering of these buttons.
         }
     }
     else if (wcscmp(className, CLASSNAME_STATIC) == 0) {
@@ -1792,7 +1915,6 @@ static void StyleWindow(HWND hwnd) {
             SendMessage(hwnd, WM_USER + 0x302, 0, (LPARAM)&item);
         }
     }
-    // Standalone sliders get the dark theme.
     else if (wcscmp(className, CLASSNAME_SCROLLBAR) == 0) {
         SetWindowTheme(hwnd, L"DarkMode_Explorer", NULL);
     }
@@ -1804,27 +1926,21 @@ static void StyleWindow(HWND hwnd) {
         SetWindowTheme(hwnd, L"DarkMode_Explorer", NULL);
         SetWindowSubclass(hwnd, UniversalSubclassProc, 6, (DWORD_PTR)GetWindowClassType(className));
     }
-    // ComboBoxes retain the old theme (this prevents those white borders in FX windows and settings!)
     else if (wcscmp(className, CLASSNAME_COMBOBOX) == 0) {
         SetWindowTheme(hwnd, L"DarkMode_CFD", NULL);
 
         // --- FX BROWSER SEARCH AUTO-SELECT FIX ---
-        // We detect the FX Filter search box using its Control ID (0x473).
-        // If it's the search box, we SKIP the de-selection so users can type immediately.
-        // For all other ComboBoxes, we clear the selection to keep the UI clean.
         int ctrlId = GetDlgCtrlID(hwnd);
         if (ctrlId != 0x473) {
             PostMessage(hwnd, CB_SETEDITSEL, 0, MAKELPARAM(-1, 0));
         }
     }
-    // Smartly separate Edit fields
     else if (wcscmp(className, CLASSNAME_EDIT) == 0) {
         DWORD style = GetWindowLong(hwnd, GWL_STYLE);
 
         if ((style & WS_VSCROLL) || (style & ES_MULTILINE)) {
             SetWindowTheme(hwnd, L"DarkMode_Explorer", NULL);
 
-            // remove WS_EX_CLIENTEDGE thick border
             DWORD exStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
             if (exStyle & WS_EX_CLIENTEDGE) {
                 SetWindowLong(hwnd, GWL_EXSTYLE, exStyle & ~WS_EX_CLIENTEDGE);
@@ -1835,7 +1951,6 @@ static void StyleWindow(HWND hwnd) {
             SetWindowTheme(hwnd, L"DarkMode_CFD", NULL);
         }
     }
-    // extension for Theme Tweaker (ListBox support)
     else if (wcscmp(className, CLASSNAME_LISTBOX) == 0) {
         SetWindowTheme(hwnd, L"DarkMode_Explorer", NULL);
 
@@ -1851,7 +1966,6 @@ static void StyleWindow(HWND hwnd) {
     else if (wcscmp(className, CLASSNAME_TREEVIEW) == 0) {
         SetWindowTheme(hwnd, L"DarkMode_Explorer", NULL);
 
-        // CRITICAL: apply colors immediately before first paint
         COLORREF bgColor = GetWindowBgColor(hwnd);
         SendMessage(hwnd, 4381, 0, (LPARAM)bgColor); // TVM_SETBKCOLOR
         SendMessage(hwnd, 4382, 0, (LPARAM)g_TextColor); // TVM_SETTEXTCOLOR
@@ -1861,7 +1975,6 @@ static void StyleWindow(HWND hwnd) {
     else if (wcscmp(className, CLASSNAME_LISTVIEW) == 0) {
         SetWindowTheme(hwnd, L"DarkMode_Explorer", NULL);
 
-        // CRITICAL: initialize ListView colors immediately (Media Explorer, Open/Save)
         COLORREF bgColor = GetWindowBgColor(hwnd);
         SendMessage(hwnd, 4097, 0, (LPARAM)bgColor); // LVM_SETBKCOLOR
         SendMessage(hwnd, 4134, 0, (LPARAM)bgColor); // LVM_SETTEXTBKCOLOR
@@ -1869,9 +1982,7 @@ static void StyleWindow(HWND hwnd) {
 
         DWORD exStyle = (DWORD)SendMessage(hwnd, 4151, 0, 0);
         exStyle |= 0x00010000; // LVS_EX_DOUBLEBUFFER
-
         exStyle &= ~0x00000001; // remove LVS_EX_GRIDLINES
-
         SendMessage(hwnd, 4150, 0, exStyle);
 
         SetWindowSubclass(hwnd, UniversalSubclassProc, 8, (DWORD_PTR)GetWindowClassType(className));
